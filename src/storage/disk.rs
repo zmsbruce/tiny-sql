@@ -259,29 +259,27 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_disk_storage() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let temp_file_path = temp_file.path().to_str().unwrap();
-        let mut storage_1 = DiskStorage::new(temp_file_path).unwrap();
+    fn test_build_keydir() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key1value1\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key2value2\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key3value3\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x80key2value2").unwrap();
 
-        storage_1.put(b"key1", b"value1").unwrap();
-        storage_1.put(b"key2", b"value2").unwrap();
-        storage_1.put(b"key3", b"value3").unwrap();
+        let storage = DiskStorage::new(file.path()).unwrap();
+        assert_eq!(storage.keydir.len(), 2);
+        assert_eq!(*storage.keydir.get(&b"key1"[..]).unwrap(), (20, 6));
+        assert!(!storage.keydir.contains_key(&b"key2"[..]));
+        assert_eq!(*storage.keydir.get(&b"key3"[..]).unwrap(), (72, 6));
+    }
 
-        assert_eq!(storage_1.get(b"key1").unwrap().unwrap(), b"value1");
-        assert_eq!(storage_1.get(b"key2").unwrap().unwrap(), b"value2");
-        assert_eq!(storage_1.get(b"key3").unwrap().unwrap(), b"value3");
+    #[test]
+    fn test_compact() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key1value1\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key2value2\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key3value3\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x80key2value2").unwrap();
 
-        storage_1.delete(b"key2").unwrap();
-        assert_eq!(storage_1.get(b"key2").unwrap(), None);
+        let mut storage = DiskStorage::new(file.path()).unwrap();
+        storage.compact().unwrap();
 
-        storage_1.compact().unwrap();
-
-        drop(storage_1);
-
-        let mut storage_2 = DiskStorage::new(temp_file_path).unwrap();
-        assert_eq!(storage_2.get(b"key1").unwrap().unwrap(), b"value1");
-        assert_eq!(storage_2.get(b"key2").unwrap(), None);
-        assert_eq!(storage_2.get(b"key3").unwrap().unwrap(), b"value3");
+        let mut buf = Vec::new();
+        storage.log.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key1value1\x04\x00\x00\x00\x00\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00key3value3");
     }
 }
