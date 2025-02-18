@@ -8,6 +8,8 @@ pub enum Error {
     ParseError(String),
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("Range error: {0}")]
+    RangeError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

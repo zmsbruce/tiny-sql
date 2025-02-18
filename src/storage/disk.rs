@@ -3,12 +3,12 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     vec,
 };
 
 use super::Storage;
-use crate::Result;
+use crate::{Error::RangeError, Result};
 
 /// 基于 Bitcast 的磁盘存储，参考论文 [Bitcask: A Log-Structured Hash Table for Key/Value Data](https://riak.com/assets/bitcask-intro.pdf)。
 ///
@@ -40,8 +40,11 @@ pub struct DiskStorage {
 
 impl DiskStorage {
     /// 创建一个新的 `DiskStorage` 实例。
-    pub fn new(filename: &str) -> Result<Self> {
-        let file_path = PathBuf::from(filename);
+    pub fn new<P>(filename: P) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let file_path = filename.as_ref().to_path_buf();
         // 如果文件所在的目录不存在，则创建目录
         // 如果目录为 None，则会在创建文件时报错
         if let Some(dir) = file_path.parent() {
@@ -100,16 +103,20 @@ impl DiskStorage {
             let mut key = vec![0u8; key_len as usize];
             file_reader.read_exact(&mut key)?;
 
-            // 跳过 value
-            file_reader.seek(SeekFrom::Current(val_len as i64))?;
-
-            if val_len == 0 {
-                // 如果 val_len 为 0，则表示该 key 对应的数据已经被删除
+            if (val_len >> (u64::BITS - 1)) != 0 {
+                // 如果 val_len 最高位为 1，则表示该 key 对应的数据已经被删除
                 self.keydir.remove(&key);
+                // 跳过 value
+                file_reader.seek(SeekFrom::Current(
+                    // val_len & !(1 << (u64::BITS - 1)) 表示去除最高位的 val_len
+                    (val_len & !(1 << (u64::BITS - 1))) as i64,
+                ))?;
             } else {
                 // 将 key 和 (offset, len) 写入 KeyDir
                 self.keydir
                     .insert(key, (offset + u64::BITS as u64 / 8 * 2 + key_len, val_len));
+                // 跳过 value
+                file_reader.seek(SeekFrom::Current(val_len as i64))?;
             }
         }
         Ok(())
@@ -196,6 +203,11 @@ impl Storage for DiskStorage {
     type Iterator<'a> = DiskStorageIterator<'a>;
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        //! value 的长度不能超过 u32::MAX，以确保不同平台下的 usize 长度一致，且 value_len 的最高位能够反映 value 是否被删除。
+        if value.len() > u32::MAX as usize {
+            return Err(RangeError("value is too large".to_string()));
+        }
+
         let offset = self.log.seek(SeekFrom::End(0))?;
 
         let mut writer = BufWriter::with_capacity(
@@ -232,12 +244,12 @@ impl Storage for DiskStorage {
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
-        if self.keydir.contains_key(key) {
+        if let Some((_, val_len)) = self.keydir.get(key) {
             self.log.seek(SeekFrom::End(0))?;
             let total_len = u64::BITS as usize / 8 * 2 + key.len();
             let mut writer = BufWriter::with_capacity(total_len, &self.log);
             writer.write_all(&(key.len() as u64).to_le_bytes())?;
-            writer.write_all(&0_u64.to_le_bytes())?;
+            writer.write_all(&(val_len | (1 << (u64::BITS - 1))).to_le_bytes())?;
             writer.write_all(key)?;
 
             self.keydir.remove(key);
