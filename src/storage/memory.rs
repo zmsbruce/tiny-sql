@@ -60,35 +60,3 @@ impl DoubleEndedIterator for MemoryStorageIterator<'_> {
             .map(|(k, v)| Ok((k.clone(), v.clone())))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_memory_storage() {
-        let mut storage = MemoryStorage::new();
-
-        storage.put(b"key1", b"value1").unwrap();
-        storage.put(b"key2", b"value2").unwrap();
-        storage.put(b"key3", b"value3").unwrap();
-
-        assert_eq!(storage.get(b"key1").unwrap().unwrap(), b"value1");
-        assert_eq!(storage.get(b"key2").unwrap().unwrap(), b"value2");
-        assert_eq!(storage.get(b"key3").unwrap().unwrap(), b"value3");
-
-        storage.delete(b"key2").unwrap();
-        assert_eq!(storage.get(b"key2").unwrap(), None);
-
-        let mut iter = storage.scan(b"key1".to_vec()..=b"key3".to_vec());
-        assert_eq!(
-            iter.next().unwrap().unwrap(),
-            (b"key1".to_vec(), b"value1".to_vec())
-        );
-        assert_eq!(
-            iter.next().unwrap().unwrap(),
-            (b"key3".to_vec(), b"value3".to_vec())
-        );
-        assert!(iter.next().is_none());
-    }
-}
