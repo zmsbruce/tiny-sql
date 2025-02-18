@@ -149,8 +149,12 @@ impl DiskStorage {
 
         // 重命名新日志文件为原日志文件
         fs::rename(&new_log_path, &self.log_path)?;
-        self.log_path = new_log_path;
-        self.log = new_log;
+
+        // 重新打开文件进行读取操作
+        self.log = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.log_path)?;
         self.log.try_lock_exclusive()?;
 
         Ok(())
