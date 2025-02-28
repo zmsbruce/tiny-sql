@@ -1,7 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::parser::ast::{Constant, Expression};
 
 /// 数据类型定义
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub enum DataType {
     Boolean,
     Integer,
@@ -10,7 +12,7 @@ pub enum DataType {
 }
 
 /// 列定义
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     pub data_type: DataType,
@@ -19,7 +21,7 @@ pub struct Column {
 }
 
 /// 值定义
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Serialize, Deserialize, Clone)]
 pub enum Value {
     Null,
     Boolean(bool),
@@ -39,7 +41,6 @@ impl From<Expression> for Value {
                 Constant::String(s) => Value::String(s),
                 Constant::Null => Value::Null,
             },
-            _ => unimplemented!(),
         }
     }
 }
@@ -58,3 +59,9 @@ impl Value {
 }
 
 pub type Row = Vec<Value>;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Table {
+    pub name: String,
+    pub columns: Vec<Column>,
+}

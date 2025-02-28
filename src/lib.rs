@@ -1,3 +1,4 @@
+mod engine;
 mod error;
 mod parser;
 pub mod schema;

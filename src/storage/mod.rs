@@ -6,6 +6,12 @@ mod disk;
 mod memory;
 mod mvcc;
 
+pub use {
+    disk::DiskStorage,
+    memory::MemoryStorage,
+    mvcc::{Mvcc, MvccTxn},
+};
+
 pub trait Storage {
     type Iterator<'a>: DoubleEndedIterator<Item = Result<(Vec<u8>, Vec<u8>)>>
     where
