@@ -162,7 +162,7 @@ mod tests {
     use super::*;
     use crate::{
         error::Result,
-        parser::ast::Constant,
+        parser::{ast::Constant, Parser},
         schema::{Column, DataType},
         storage::MemoryStorage,
     };
@@ -234,6 +234,48 @@ mod tests {
         let stmt = Statement::Select {
             table_name: "users".to_string(),
         };
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::String("Alice".to_string())],
+                    vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
+                ]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
+        Ok(())
+    }
+
+    fn parse_sql(sql: &str) -> Result<Statement> {
+        let mut parser = Parser::new(sql);
+        parser.parse()
+    }
+
+    #[test]
+    fn test_sql() -> Result<()> {
+        let storage = MemoryStorage::new();
+        let engine = Engine::new(storage);
+        let executor = Executor::from_engine(&engine)?;
+
+        let sql = "CREATE TABLE users (id INTEGER, name TEXT NULL DEFAULT 'Momo');";
+        let stmt = parse_sql(sql)?;
+        executor.execute(stmt)?;
+
+        let sql = "INSERT INTO users VALUES (1, 'Alice'), (2, NULL);";
+        let stmt = parse_sql(sql)?;
+        executor.execute(stmt)?;
+
+        let sql = "INSERT INTO users (id) VALUES (3);";
+        let stmt = parse_sql(sql)?;
+        executor.execute(stmt)?;
+
+        let sql = "SELECT * FROM users;";
+        let stmt = parse_sql(sql)?;
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
