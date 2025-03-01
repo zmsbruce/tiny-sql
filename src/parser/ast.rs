@@ -1,7 +1,7 @@
 use crate::schema::Column;
 
 /// 常量定义
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Constant {
     Null,
     Boolean(bool),
@@ -12,7 +12,7 @@ pub enum Constant {
 
 /// 表达式定义
 /// 目前只支持常量，后续会支持计算表达式
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Expression {
     Constant(Constant),
 }

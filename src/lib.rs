@@ -1,7 +1,8 @@
 mod engine;
 mod error;
-mod parser;
-pub mod schema;
-mod storage;
+pub mod executor;
+pub mod parser;
+mod schema;
+pub mod storage;
 
 pub use error::{Error, Result};
