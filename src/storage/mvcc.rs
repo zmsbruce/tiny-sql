@@ -169,10 +169,7 @@ impl<S: Storage> MvccTxn<S> {
         };
 
         // 将下一个版本号加 1，写入存储引擎
-        storage.put(
-            &MvccKey::NextVersion.encode()?,
-            &bincode::serialize(&(version + 1))?,
-        )?;
+        storage.put(&MvccKey::NextVersion.encode()?, &(version + 1).encode()?)?;
 
         // 扫描所有活跃事务
         let active_versions = Self::scan_active_txn(&mut storage)?;

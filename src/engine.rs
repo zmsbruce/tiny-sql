@@ -21,7 +21,7 @@ impl<S: Storage> Engine<S> {
     }
 
     /// 开启一个新的事务
-    pub fn start_txn(&mut self) -> Result<Transaction<S>> {
+    pub fn start_txn(&self) -> Result<Transaction<S>> {
         Ok(Transaction {
             txn: self.mvcc.start_txn()?,
         })
@@ -165,7 +165,7 @@ mod tests {
     #[test]
     fn test_engine() {
         let storage = MemoryStorage::new();
-        let mut engine = Engine::new(storage);
+        let engine = Engine::new(storage);
         let txn = engine.start_txn().unwrap();
 
         let table = Table {

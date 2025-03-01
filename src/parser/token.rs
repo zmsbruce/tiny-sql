@@ -36,22 +36,3 @@ impl Display for Token {
         })
     }
 }
-
-impl Token {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Token::Keyword(k) => k.as_str(),
-            Token::Identifier(s) => s,
-            Token::String(s) => s,
-            Token::Number(s) => s,
-            Token::OpenParen => "(",
-            Token::CloseParen => ")",
-            Token::Comma => ",",
-            Token::Semicolon => ";",
-            Token::Asterisk => "*",
-            Token::Plus => "+",
-            Token::Minus => "-",
-            Token::Slash => "/",
-        }
-    }
-}
