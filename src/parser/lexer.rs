@@ -1,45 +1,160 @@
-use std::{iter::Peekable, str::Chars};
+use std::{fmt::Display, iter::Peekable, str::Chars};
 
-use super::{keyword::Keyword, token::Token};
-use crate::{Error::ParseError, Result};
+use crate::{
+    Error::{self, ParseError},
+    Result,
+};
+
+/// 词法分析 Token 结构体
+#[derive(Debug, PartialEq, Clone)]
+pub enum Token {
+    Keyword(Keyword),   // 关键字，如 SELECT
+    Identifier(String), // 标识符，如表名、列名
+    String(String),     // 字符串类型的数据
+    Number(String),     // 数值类型，比如整数和浮点数
+    OpenParen,          // 左括号 (
+    CloseParen,         // 右括号 )
+    Comma,              // 逗号 ,
+    Semicolon,          // 分号 ;
+    Asterisk,           // 星号 *
+    Plus,               // 加号 +
+    Minus,              // 减号 -
+    Slash,              // 斜杠 /
+    Equal,              // 等号 =
+}
+
+impl Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Token::Keyword(k) => write!(f, "{}", k),
+            Token::Identifier(s) => write!(f, "{}", s),
+            Token::String(s) => write!(f, "{}", s),
+            Token::Number(s) => write!(f, "{}", s),
+            Token::OpenParen => write!(f, "("),
+            Token::CloseParen => write!(f, ")"),
+            Token::Comma => write!(f, ","),
+            Token::Semicolon => write!(f, ";"),
+            Token::Asterisk => write!(f, "*"),
+            Token::Plus => write!(f, "+"),
+            Token::Minus => write!(f, "-"),
+            Token::Slash => write!(f, "/"),
+            Token::Equal => write!(f, "="),
+        }
+    }
+}
+
+/// 关键字定义
+#[derive(Debug, PartialEq, Clone)]
+pub enum Keyword {
+    Create,
+    Table,
+    Int,
+    Integer,
+    Boolean,
+    Bool,
+    String,
+    Text,
+    Varchar,
+    Float,
+    Double,
+    Select,
+    From,
+    Insert,
+    Into,
+    Values,
+    True,
+    False,
+    Default,
+    Not,
+    Null,
+    Primary,
+    Key,
+    Update,
+    Set,
+    Where,
+}
+
+impl TryFrom<&str> for Keyword {
+    type Error = Error;
+
+    /// 将字符串转换为关键字
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        let keyword = match value.to_uppercase().as_str() {
+            "CREATE" => Keyword::Create,
+            "TABLE" => Keyword::Table,
+            "INT" => Keyword::Int,
+            "INTEGER" => Keyword::Integer,
+            "BOOLEAN" => Keyword::Boolean,
+            "BOOL" => Keyword::Bool,
+            "STRING" => Keyword::String,
+            "TEXT" => Keyword::Text,
+            "VARCHAR" => Keyword::Varchar,
+            "FLOAT" => Keyword::Float,
+            "DOUBLE" => Keyword::Double,
+            "SELECT" => Keyword::Select,
+            "FROM" => Keyword::From,
+            "INSERT" => Keyword::Insert,
+            "INTO" => Keyword::Into,
+            "VALUES" => Keyword::Values,
+            "TRUE" => Keyword::True,
+            "FALSE" => Keyword::False,
+            "DEFAULT" => Keyword::Default,
+            "NOT" => Keyword::Not,
+            "NULL" => Keyword::Null,
+            "PRIMARY" => Keyword::Primary,
+            "KEY" => Keyword::Key,
+            "UPDATE" => Keyword::Update,
+            "SET" => Keyword::Set,
+            "WHERE" => Keyword::Where,
+            keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
+        };
+        Ok(keyword)
+    }
+}
+
+impl TryFrom<String> for Keyword {
+    type Error = Error;
+
+    /// 将字符串转换为关键字
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Keyword::try_from(value.as_str())
+    }
+}
+
+impl Display for Keyword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Keyword::Create => "CREATE",
+            Keyword::Table => "TABLE",
+            Keyword::Int => "INT",
+            Keyword::Integer => "INTEGER",
+            Keyword::Boolean => "BOOLEAN",
+            Keyword::Bool => "BOOL",
+            Keyword::String => "STRING",
+            Keyword::Text => "TEXT",
+            Keyword::Varchar => "VARCHAR",
+            Keyword::Float => "FLOAT",
+            Keyword::Double => "DOUBLE",
+            Keyword::Select => "SELECT",
+            Keyword::From => "FROM",
+            Keyword::Insert => "INSERT",
+            Keyword::Into => "INTO",
+            Keyword::Values => "VALUES",
+            Keyword::True => "TRUE",
+            Keyword::False => "FALSE",
+            Keyword::Default => "DEFAULT",
+            Keyword::Not => "NOT",
+            Keyword::Null => "NULL",
+            Keyword::Primary => "PRIMARY",
+            Keyword::Key => "KEY",
+            Keyword::Update => "UPDATE",
+            Keyword::Set => "SET",
+            Keyword::Where => "WHERE",
+        })
+    }
+}
 
 /// 词法分析 Lexer 结构体
-///
-/// # 支持的 SQL 语法
-///
-/// ## Create Table
-///
-/// ```sql
-/// CREATE TABLE table_name (
-///     [ column_name data_type [ column_constraint [...] ] ]
-///     [, ... ]
-/// );
-/// ```
-///
-/// data_type:
-/// - `BOOLEAN(BOOL)`: `true` | `false`
-/// - `FLOAT(DOUBLE)`
-/// - `INTEGER(INT)`
-/// - `STRING(TEXT, VARCHAR)`
-///
-/// column_constraint:
-/// - `NOT NULL`
-/// - `NULL`
-/// - `DEFAULT expr`
-///
-/// ## Insert Into
-///     
-/// ```sql
-/// INSERT INTO table_name
-/// [ ( column_name [, ...] ) ]
-/// values ( expr [, ...] );
-/// ```
-///
-/// ## Select * From
-///
-/// ```sql
-/// SELECT * FROM table_name;
-/// ```
 pub struct Lexer<'a> {
     iter: Peekable<Chars<'a>>,
 }
@@ -100,7 +215,7 @@ impl<'a> Lexer<'a> {
         Err(ParseError("Expect a single quote".to_string()))
     }
 
-    /// 扫描数字，支持 `123`、`123.456`、`456.` 格式，否则返回 `LexError`。
+    /// 扫描数字，支持 `123`、`123.456`、`456.` 格式，否则返回 `ParseError`。
     fn scan_number(&mut self) -> Result<Token> {
         // 如果不以数字开头，则返回错误
         if self.iter.peek().filter(|c| c.is_ascii_digit()).is_none() {
@@ -116,7 +231,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// 扫描标识符或者关键字。如果扫描的 Token 不在关键字列表中，则认为其为标识符。
-    /// Token 必须以字母开头，否则返回 `LexError`。
+    /// Token 必须以字母开头，否则返回 `ParseError`。
     fn scan_identifier_or_keyword(&mut self) -> Result<Token> {
         let mut s = self
             .next_if(|c| c.is_alphabetic())
@@ -128,7 +243,7 @@ impl<'a> Lexer<'a> {
             .map_or_else(|_| Token::Identifier(s.to_lowercase()), Token::Keyword))
     }
 
-    /// 扫描符号，Token 必须为 `*(),;+-/` 中的一个，否则返回 `LexError`。
+    /// 扫描符号，Token 必须为 `*(),;+-/` 中的一个，否则返回 `ParseError`。
     fn scan_symbol(&mut self) -> Result<Token> {
         let sym = self
             .iter
@@ -142,6 +257,7 @@ impl<'a> Lexer<'a> {
                 '+' => Some(Token::Plus),
                 '-' => Some(Token::Minus),
                 '/' => Some(Token::Slash),
+                '=' => Some(Token::Equal),
                 _ => None,
             })
             .ok_or(ParseError("Expect a symbol".to_string()))?;
@@ -150,7 +266,7 @@ impl<'a> Lexer<'a> {
     }
 
     /// 扫描下一个 Token。
-    /// 正常情况下返回 `Some(Token)`。如果全部扫描完成，返回 `None`，如果 Token 不合法，返回 `Some(LexError)`。
+    /// 正常情况下返回 `Some(Token)`。如果全部扫描完成，返回 `None`，如果 Token 不合法，返回 `Some(ParseError)`。
     fn scan_next_token(&mut self) -> Option<Result<Token>> {
         // 移除 Token 前面的空格
         self.erase_whitespace();
@@ -177,6 +293,40 @@ impl Iterator for Lexer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_keyword_try_from() {
+        let keywords = vec![
+            Keyword::Create,
+            Keyword::Table,
+            Keyword::Int,
+            Keyword::Integer,
+            Keyword::Boolean,
+            Keyword::Bool,
+            Keyword::String,
+            Keyword::Text,
+            Keyword::Varchar,
+            Keyword::Float,
+            Keyword::Double,
+            Keyword::Select,
+            Keyword::From,
+            Keyword::Insert,
+            Keyword::Into,
+            Keyword::Values,
+            Keyword::True,
+            Keyword::False,
+            Keyword::Default,
+            Keyword::Not,
+            Keyword::Null,
+            Keyword::Primary,
+            Keyword::Key,
+        ];
+        for kw in keywords {
+            let s = kw.to_string().to_lowercase();
+            let result = Keyword::try_from(s).unwrap();
+            assert_eq!(result, kw);
+        }
+    }
 
     #[test]
     fn test_next_if() {
@@ -271,7 +421,8 @@ mod tests {
             Keyword::Key,
         ];
         for kw in keywords {
-            let mut lexer = Lexer::new(kw.as_str());
+            let kw_string = kw.to_string();
+            let mut lexer = Lexer::new(&kw_string);
             assert_eq!(
                 lexer.scan_identifier_or_keyword().unwrap(),
                 Token::Keyword(kw)

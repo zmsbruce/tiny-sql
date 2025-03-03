@@ -1,4 +1,4 @@
-use std::iter::Peekable;
+use std::{collections::HashMap, iter::Peekable};
 
 use crate::{
     schema::{Column, DataType},
@@ -6,14 +6,10 @@ use crate::{
     Result,
 };
 use ast::{Constant, Expression, Statement};
-use keyword::Keyword;
-use lexer::Lexer;
-use token::Token;
+use lexer::{Keyword, Lexer, Token};
 
 pub mod ast;
-mod keyword;
 mod lexer;
-mod token;
 
 /// SQL 解析器
 pub struct Parser<'a> {
@@ -32,18 +28,20 @@ impl<'a> Parser<'a> {
     ///
     /// 支持的语句：
     /// - select * from [table_name];
-    /// - create table [table_name] ([column_name] [data_type] [nullable] [default], ...);
+    /// - create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     /// - insert into [table_name] ([column_name], ...) values ([value], ...);
+    /// - update [table_name] set [column_name] = [value], ... where [condition];
     pub fn parse(&mut self) -> Result<Statement> {
         // 根据第一个 token 的类型选择解析方法
         let stmt = match self
             .lexer
             .peek()
-            .ok_or(ParseError("Reaching end of file".to_string()))?
+            .ok_or(ParseError("Unexpected end of input".to_string()))?
         {
             Ok(Token::Keyword(Keyword::Select)) => self.parse_select(),
             Ok(Token::Keyword(Keyword::Create)) => self.parse_create_table(),
             Ok(Token::Keyword(Keyword::Insert)) => self.parse_insert(),
+            Ok(Token::Keyword(Keyword::Update)) => self.parse_update(),
             Ok(token) => Err(ParseError(format!("Unexpected token {token}"))),
             Err(e) => Err(ParseError(format!("Lexical error: {e}"))),
         };
@@ -71,7 +69,7 @@ impl<'a> Parser<'a> {
             Some(Ok(token)) if f(token) => self.lexer.next().unwrap(),
             Some(Ok(token)) => Err(ParseError(format!("Unexpected token {token}"))),
             Some(Err(e)) => Err(ParseError(format!("Lexical error: {e}"))),
-            None => Err(ParseError("Reaching end of file".to_string())),
+            None => Err(ParseError("Unexpected end of input".to_string())),
         }
     }
 
@@ -114,6 +112,63 @@ impl<'a> Parser<'a> {
         Ok(Statement::Select { table_name })
     }
 
+    /// 解析 UPDATE 语句
+    /// 语法：UPDATE [table_name] SET [column_name] = [value], ... WHERE [condition];
+    fn parse_update(&mut self) -> Result<Statement> {
+        self.next_token_equal(Token::Keyword(Keyword::Update))?;
+
+        // 获取表名
+        let table_name = self.next_identifier()?;
+        self.next_token_equal(Token::Keyword(Keyword::Set))?;
+
+        // 获取列名和值
+        let mut columns = HashMap::new();
+        loop {
+            // 获取列名
+            let col_name = self.next_identifier()?;
+            self.next_token_equal(Token::Equal)?;
+
+            // 获取值
+            let value = self.parse_expression()?;
+            if columns.contains_key(&col_name) {
+                return Err(ParseError(format!("Duplicate column name {col_name}")));
+            }
+            columns.insert(col_name, value);
+
+            // 如果没有逗号，说明列名和值解析结束，跳出循环
+            if self.next_token_equal(Token::Comma).is_err() {
+                break;
+            }
+        }
+
+        // 如果有 WHERE 子句，则解析 WHERE 子句
+        let where_clause = if self
+            .next_token_if(|t| *t == Token::Keyword(Keyword::Where))
+            .is_ok()
+        {
+            Some(self.parse_where_clause()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::Update {
+            table_name,
+            columns,
+            where_clause,
+        })
+    }
+
+    /// 解析 WHERE 子句
+    /// 语法：WHERE column_name = expression
+    ///
+    /// 目前只支持单个表达式且仅为等于操作，不支持其他操作符和表达式组合
+    fn parse_where_clause(&mut self) -> Result<(String, Expression)> {
+        let col_name = self.next_identifier()?;
+        self.next_token_equal(Token::Equal)?;
+        let val = self.parse_expression()?;
+        Ok((col_name, val))
+    }
+
     /// 解析列定义
     /// 语法：[column_name] [data_type] [nullable] [default]
     fn parse_column(&mut self) -> Result<Column> {
@@ -140,6 +195,7 @@ impl<'a> Parser<'a> {
             data_type,
             nullable: false,
             default: None,
+            primary_key: false,
         };
 
         // 解析列的其他属性
@@ -153,6 +209,11 @@ impl<'a> Parser<'a> {
                 }
                 // 如果是 DEFAULT，则期望下一个 token 是一个表达式，设置列的默认值
                 Keyword::Default => column.default = Some(self.parse_expression()?.into()),
+                // 如果是 PRIMARY KEY，则设置列为主键
+                Keyword::Primary => {
+                    self.next_token_equal(Token::Keyword(Keyword::Key))?;
+                    column.primary_key = true;
+                }
                 // 其他关键字，返回未知的关键字错误
                 k => return Err(ParseError(format!("Unexpected keyword {k}"))),
             }
@@ -167,7 +228,6 @@ impl<'a> Parser<'a> {
         let exp = match self.next_token()? {
             Token::Number(num_str) => {
                 // 如果是数字，则解析为整数或浮点数
-                // TODO: 支持更多的数字类型，比如十六进制、科学计数法等
                 if num_str.chars().all(|ch| ch.is_ascii_digit()) {
                     // 如果数字全部是 0-9，则判断为整数
                     let num = num_str.parse::<i64>()?;
@@ -326,7 +386,7 @@ mod tests {
 
     #[test]
     fn test_parse_column() {
-        let mut parser = Parser::new("name VARCHAR NOT NULL DEFAULT 'hello')");
+        let mut parser = Parser::new("name VARCHAR NOT NULL DEFAULT 'hello' PRIMARY KEY)");
         let column = parser.parse_column().unwrap();
         assert_eq!(
             column,
@@ -335,6 +395,7 @@ mod tests {
                 data_type: DataType::String,
                 nullable: false,
                 default: Some(Expression::from(Constant::String("hello".to_string())).into()),
+                primary_key: true,
             }
         );
     }
@@ -375,11 +436,12 @@ mod tests {
                     data_type: DataType::String,
                     nullable: true,
                     default: Some(Expression::from(Constant::String("hello".to_string())).into()),
+                    primary_key: false,
                 }],
             }
         );
 
-        parser = Parser::new("CREATE TABLE table1 (id INT, name VARCHAR)");
+        parser = Parser::new("CREATE TABLE table1 (id INT PRIMARY KEY, name VARCHAR)");
         let statement = parser.parse_create_table().unwrap();
         assert_eq!(
             statement,
@@ -391,12 +453,14 @@ mod tests {
                         data_type: DataType::Integer,
                         nullable: false,
                         default: None,
+                        primary_key: true,
                     },
                     Column {
                         name: "name".to_string(),
                         data_type: DataType::String,
                         nullable: false,
                         default: None,
+                        primary_key: false,
                     },
                 ],
             }
@@ -435,42 +499,71 @@ mod tests {
     }
 
     #[test]
-    fn test_parse() {
-        let mut parser = Parser::new("SELECT * FROM table1;");
-        let statement = parser.parse().unwrap();
+    fn test_parse_update() {
+        let mut parser = Parser::new("UPDATE table1 SET name = 'hello' WHERE id = 1");
+        let statement = parser.parse_update().unwrap();
         assert_eq!(
             statement,
-            Statement::Select {
-                table_name: "table1".to_string()
-            }
-        );
-
-        parser = Parser::new("CREATE TABLE table1 (name VARCHAR NOT NULL DEFAULT 'hello');");
-        let statement = parser.parse().unwrap();
-        assert_eq!(
-            statement,
-            Statement::CreateTable {
-                name: "table1".to_string(),
-                columns: vec![Column {
-                    name: "name".to_string(),
-                    data_type: DataType::String,
-                    nullable: false,
-                    default: Some(Expression::from(Constant::String("hello".to_string())).into()),
-                }],
-            }
-        );
-
-        parser = Parser::new("INSERT INTO table1 VALUES (1, 'hello');");
-        let statement = parser.parse().unwrap();
-        assert_eq!(
-            statement,
-            Statement::Insert {
+            Statement::Update {
                 table_name: "table1".to_string(),
-                columns: None,
-                values: vec![vec![
-                    Expression::from(Constant::Integer(1)),
-                    Expression::from(Constant::String("hello".to_string())),
-                ]],
+                columns: vec![(
+                    "name".to_string(),
+                    Expression::from(Constant::String("hello".to_string()))
+                )]
+                .into_iter()
+                .collect(),
+                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+            }
+        );
+
+        parser = Parser::new("UPDATE table1 SET name = 'hello', age = 18 WHERE id = 1");
+        let statement = parser.parse_update().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Update {
+                table_name: "table1".to_string(),
+                columns: vec![
+                    (
+                        "name".to_string(),
+                        Expression::from(Constant::String("hello".to_string()))
+                    ),
+                    ("age".to_string(), Expression::from(Constant::Integer(18))),
+                ]
+                .into_iter()
+                .collect(),
+                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+            }
+        );
+
+        parser = Parser::new("UPDATE table1 SET name = 'hello' WHERE id = 1 AND age = 18");
+        let statement = parser.parse_update().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Update {
+                table_name: "table1".to_string(),
+                columns: vec![(
+                    "name".to_string(),
+                    Expression::from(Constant::String("hello".to_string()))
+                )]
+                .into_iter()
+                .collect(),
+                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+            }
+        );
+
+        parser = Parser::new("UPDATE table1 SET name = 'hello' AND age = 18");
+        let statement = parser.parse_update().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Update {
+                table_name: "table1".to_string(),
+                columns: vec![(
+                    "name".to_string(),
+                    Expression::from(Constant::String("hello".to_string()))
+                )]
+                .into_iter()
+                .collect(),
+                where_clause: None,
             }
         );
     }

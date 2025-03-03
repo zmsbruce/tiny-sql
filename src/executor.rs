@@ -15,6 +15,7 @@ pub enum ExecuteResult {
         columns: Vec<String>,
         rows: Vec<Row>,
     },
+    Update(usize),
 }
 
 /// SQL 执行器
@@ -50,7 +51,7 @@ impl<S: Storage> Executor<S> {
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
             Statement::CreateTable { name, columns } => {
-                let table = Table { name, columns };
+                let table = Table::new(&name, columns)?;
                 self.transaction.create_table(table)?;
 
                 Ok(ExecuteResult::CreateTable)
@@ -64,16 +65,16 @@ impl<S: Storage> Executor<S> {
                 Ok(ExecuteResult::Insert)
             }
             Statement::Select { table_name } => {
-                let columns = self
-                    .transaction
-                    .get_table_info(&table_name)?
-                    .ok_or(InternalError(format!("Table {table_name} not found")))?
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect();
-                let rows = self.transaction.scan_table(&table_name)?;
+                let (columns, rows) = self.scan(&table_name, None)?;
                 Ok(ExecuteResult::Scan { columns, rows })
+            }
+            Statement::Update {
+                table_name,
+                columns,
+                where_clause,
+            } => {
+                let count = self.update(table_name, columns, where_clause)?;
+                Ok(ExecuteResult::Update(count))
             }
         }
     }
@@ -93,6 +94,26 @@ impl<S: Storage> Executor<S> {
         Ok(())
     }
 
+    /// 扫描表
+    fn scan(
+        &self,
+        table_name: &str,
+        filter: Option<(String, Expression)>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let columns = self
+            .transaction
+            .get_table(table_name)?
+            .ok_or(InternalError(format!("Table {table_name} not found")))?
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+
+        let rows = self.transaction.scan_table(table_name, filter)?;
+
+        Ok((columns, rows))
+    }
+
     /// 插入数据
     fn insert(
         &self,
@@ -102,7 +123,7 @@ impl<S: Storage> Executor<S> {
     ) -> Result<()> {
         let table_columns = &self
             .transaction
-            .get_table_info(&table_name)?
+            .get_table(&table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?
             .columns;
 
@@ -155,6 +176,39 @@ impl<S: Storage> Executor<S> {
 
         Ok(())
     }
+
+    /// 更新数据
+    fn update(
+        &self,
+        table_name: String,
+        columns: HashMap<String, Expression>,
+        where_clause: Option<(String, Expression)>,
+    ) -> Result<usize> {
+        let table = self
+            .transaction
+            .get_table(&table_name)?
+            .ok_or(InternalError(format!("Table {table_name} not found")))?;
+        let (_, rows) = self.scan(&table_name, where_clause)?;
+
+        let mut updated_count = 0;
+        for row in rows {
+            let mut updated_row = row.clone();
+            let primary_key = table.get_primary_key(&row);
+
+            for (col_name, expr) in &columns {
+                let col_idx = table.get_col_idx(col_name).ok_or(InternalError(format!(
+                    "Column {} not found in table {}",
+                    col_name, table_name
+                )))?;
+                updated_row[col_idx] = Value::from(expr.clone());
+            }
+            self.transaction
+                .update_row(&table, primary_key, &updated_row)?;
+            updated_count += 1;
+        }
+
+        Ok(updated_count)
+    }
 }
 
 #[cfg(test)]
@@ -181,12 +235,14 @@ mod tests {
                     data_type: DataType::Integer,
                     nullable: false,
                     default: None,
+                    primary_key: true,
                 },
                 Column {
                     name: "name".to_string(),
                     data_type: DataType::String,
                     nullable: true,
                     default: Some(Value::String("Momo".to_string())),
+                    primary_key: false,
                 },
             ],
         };
@@ -248,6 +304,40 @@ mod tests {
             panic!("Expect ExecuteResult::Scan");
         }
 
+        let stmt = Statement::Update {
+            table_name: "users".to_string(),
+            columns: vec![(
+                "name".to_string(),
+                Expression::Constant(Constant::String("Bob".to_string())),
+            )]
+            .into_iter()
+            .collect(),
+            where_clause: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+        };
+        let result = executor.execute(stmt)?;
+        if let ExecuteResult::Update(count) = result {
+            assert_eq!(count, 1);
+        } else {
+            panic!("Expect ExecuteResult::Update");
+        }
+
+        let stmt = Statement::Select {
+            table_name: "users".to_string(),
+        };
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::String("Bob".to_string())],
+                    vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
+                ]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
         Ok(())
     }
 
@@ -262,7 +352,7 @@ mod tests {
         let engine = Engine::new(storage);
         let executor = Executor::from_engine(&engine)?;
 
-        let sql = "CREATE TABLE users (id INTEGER, name TEXT NULL DEFAULT 'Momo');";
+        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NULL DEFAULT 'Momo');";
         let stmt = parse_sql(sql)?;
         executor.execute(stmt)?;
 
@@ -282,6 +372,31 @@ mod tests {
                 rows,
                 vec![
                     vec![Value::Integer(1), Value::String("Alice".to_string())],
+                    vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
+                ]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
+        let sql = "UPDATE users SET name = 'Bob' WHERE id = 1;";
+        let stmt = parse_sql(sql)?;
+        let result = executor.execute(stmt)?;
+        if let ExecuteResult::Update(count) = result {
+            assert_eq!(count, 1);
+        } else {
+            panic!("Expect ExecuteResult::Update");
+        }
+
+        let sql = "SELECT * FROM users;";
+        let stmt = parse_sql(sql)?;
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(2), Value::Null],
                     vec![Value::Integer(3), Value::String("Momo".to_string())],
                 ]

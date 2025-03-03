@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::schema::Column;
 
 /// 常量定义
@@ -42,5 +44,10 @@ pub enum Statement {
     },
     Select {
         table_name: String,
+    },
+    Update {
+        table_name: String,
+        columns: HashMap<String, Expression>,
+        where_clause: Option<(String, Expression)>,
     },
 }

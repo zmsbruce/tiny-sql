@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    parser::ast::Expression,
     schema::{Row, Table, Value},
     storage::{Mvcc, MvccTxn, Storage},
     Error::InternalError,
@@ -58,7 +59,7 @@ pub struct Transaction<S: Storage> {
 
 impl<S: Storage> Transaction<S> {
     /// 获取表信息
-    pub fn get_table_info(&self, table_name: &str) -> Result<Option<Table>> {
+    pub fn get_table(&self, table_name: &str) -> Result<Option<Table>> {
         let key = Key::Table(table_name.to_string());
         let table = self
             .txn
@@ -72,7 +73,7 @@ impl<S: Storage> Transaction<S> {
     pub fn create_row(&self, table_name: &str, row: &Row) -> Result<()> {
         // 如果表不存在，返回错误
         let table = self
-            .get_table_info(table_name)?
+            .get_table(table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
 
         // 检查行数据是否符合表定义
@@ -94,8 +95,8 @@ impl<S: Storage> Transaction<S> {
             }
         }
 
-        // TODO: 这里假定第一列是主键，唯一标识数据
-        let key = Key::Row(table_name.to_string(), row[0].clone());
+        // 将行数据序列化后存储，键为表名和主键值
+        let key = Key::Row(table_name.to_string(), table.get_primary_key(row).clone());
         let value = bincode::serialize(row)?;
         self.txn.set(&bincode::serialize(&key)?, &value)?;
 
@@ -105,17 +106,9 @@ impl<S: Storage> Transaction<S> {
     /// 创建表
     pub fn create_table(&self, table: Table) -> Result<()> {
         // 检查表是否已经存在，如果存在则返回错误
-        if self.get_table_info(&table.name)?.is_some() {
+        if self.get_table(&table.name)?.is_some() {
             return Err(InternalError(format!(
                 "Table {} already exists",
-                table.name
-            )));
-        }
-
-        // 检查表是否有列定义，如果没有则返回错误
-        if table.columns.is_empty() {
-            return Err(InternalError(format!(
-                "Table {} has no columns",
                 table.name
             )));
         }
@@ -128,17 +121,53 @@ impl<S: Storage> Transaction<S> {
     }
 
     /// 扫描表
-    pub fn scan_table(&self, table_name: &str) -> Result<Vec<Row>> {
+    pub fn scan_table(
+        &self,
+        table_name: &str,
+        filter: Option<(String, Expression)>,
+    ) -> Result<Vec<Row>> {
         let prefix = KeyPrefix::Row(table_name.to_string());
         let result = self.txn.scan_prefix(&bincode::serialize(&prefix)?)?;
+        let table = self
+            .get_table(table_name)?
+            .ok_or(InternalError(format!("Table {table_name} not found")))?;
 
-        let mut rows = Vec::with_capacity(result.len());
+        let mut rows = Vec::new();
         for (_, value) in result {
-            let row = bincode::deserialize(&value)?;
+            let row: Row = bincode::deserialize(&value)?;
+            // 如果有过滤条件，检查是否符合条件
+            if let Some((col, expr)) = &filter {
+                let col_idx = table.get_col_idx(col).ok_or(InternalError(format!(
+                    "Column {} not found in table {}",
+                    col, table_name
+                )))?;
+                if Value::from(expr.clone()) != row[col_idx] {
+                    continue;
+                }
+            }
             rows.push(row);
         }
 
         Ok(rows)
+    }
+
+    /// 更新行数据
+    ///
+    /// `pk` 为要更新的行的主键值，`row` 为新的行数据，`row` 的主键值不一定和 `pk` 相同。
+    pub fn update_row(&self, table: &Table, pk: &Value, row: &Row) -> Result<()> {
+        // 如果更新了主键，则需要删除原来的数据
+        let row_pk = table.get_primary_key(row);
+        if row_pk != pk {
+            let key = Key::Row(table.name.clone(), pk.clone());
+            self.txn.delete(&bincode::serialize(&key)?)?;
+        }
+
+        // 更新行数据
+        let key = Key::Row(table.name.clone(), row_pk.clone());
+        let value = bincode::serialize(row)?;
+        self.txn.set(&bincode::serialize(&key)?, &value)?;
+
+        Ok(())
     }
 
     /// 提交事务
@@ -158,6 +187,7 @@ impl<S: Storage> Transaction<S> {
 mod tests {
     use super::*;
     use crate::{
+        parser::ast::Constant,
         schema::{Column, DataType},
         storage::MemoryStorage,
     };
@@ -168,26 +198,26 @@ mod tests {
         let engine = Engine::new(storage);
         let txn = engine.start_txn().unwrap();
 
-        let table = Table {
-            name: "users".to_string(),
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                    default: None,
-                },
-                Column {
-                    name: "name".to_string(),
-                    data_type: DataType::String,
-                    nullable: true,
-                    default: Some(Value::String("".to_string())),
-                },
-            ],
-        };
+        let columns = vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Integer,
+                nullable: false,
+                default: None,
+                primary_key: true,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: DataType::String,
+                nullable: true,
+                default: Some(Value::String("".to_string())),
+                primary_key: false,
+            },
+        ];
+        let table = Table::new("users", columns).unwrap();
         txn.create_table(table).unwrap();
 
-        let table = txn.get_table_info("users").unwrap().unwrap();
+        let table = txn.get_table("users").unwrap().unwrap();
         assert_eq!(table.name, "users");
 
         assert_eq!(table.columns[0].name, "id");
@@ -207,14 +237,25 @@ mod tests {
             vec![Value::Integer(42), Value::String("zmsbruce".to_string())],
             vec![
                 Value::Integer(114514),
-                Value::String("Todokoro".to_string()),
+                Value::String("Tadokoro".to_string()),
             ],
         ];
         for row in rows.iter() {
             txn.create_row("users", row).unwrap();
         }
 
-        let rows_scan = txn.scan_table("users").unwrap();
+        let rows_scan = txn.scan_table("users", None).unwrap();
         assert_eq!(rows_scan, rows);
+
+        let rows_scan = txn
+            .scan_table(
+                "users",
+                Some((
+                    "id".to_string(),
+                    Expression::Constant(Constant::Integer(42)),
+                )),
+            )
+            .unwrap();
+        assert_eq!(rows_scan.len(), 1);
     }
 }
