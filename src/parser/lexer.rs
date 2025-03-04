@@ -73,6 +73,10 @@ pub enum Keyword {
     Set,
     Where,
     Delete,
+    Order,
+    By,
+    Asc,
+    Desc,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -108,6 +112,10 @@ impl TryFrom<&str> for Keyword {
             "SET" => Keyword::Set,
             "WHERE" => Keyword::Where,
             "DELETE" => Keyword::Delete,
+            "ORDER" => Keyword::Order,
+            "BY" => Keyword::By,
+            "ASC" => Keyword::Asc,
+            "DESC" => Keyword::Desc,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -153,6 +161,10 @@ impl Display for Keyword {
             Keyword::Set => "SET",
             Keyword::Where => "WHERE",
             Keyword::Delete => "DELETE",
+            Keyword::Order => "ORDER",
+            Keyword::By => "BY",
+            Keyword::Asc => "ASC",
+            Keyword::Desc => "DESC",
         })
     }
 }

@@ -5,7 +5,7 @@ use crate::{
     Error::ParseError,
     Result,
 };
-use ast::{Constant, Expression, Statement};
+use ast::{Constant, Expression, Ordering, Statement};
 use lexer::{Keyword, Lexer, Token};
 
 pub mod ast;
@@ -27,7 +27,7 @@ impl<'a> Parser<'a> {
     /// 解析 SQL 语句
     ///
     /// 支持的语句：
-    /// - select * from [table_name];
+    /// - select * from [table_name] [where [condition]] [order by [column_name] [asc|desc]];
     /// - create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     /// - insert into [table_name] ([column_name], ...) values ([value], ...);
     /// - update [table_name] set [column_name] = [value], ... where [condition];
@@ -111,7 +111,47 @@ impl<'a> Parser<'a> {
         self.next_token_equal(Token::Keyword(Keyword::From))?; // 期望下一个 token 是 FROM
 
         let table_name = self.next_identifier()?; // 获取表名
-        Ok(Statement::Select { table_name })
+
+        // 如果有 WHERE 子句，则解析 WHERE 子句
+        let filter = self
+            .next_token_equal(Token::Keyword(Keyword::Where))
+            .ok()
+            .map(|_| self.parse_where_clause())
+            .transpose()?;
+
+        // 如果有 ORDER BY 子句，则解析 ORDER BY 子句
+        let ordering = self
+            .next_token_equal(Token::Keyword(Keyword::Order))
+            .ok()
+            .map(|_| {
+                self.next_token_equal(Token::Keyword(Keyword::By))?; // 期望下一个 token 是 BY
+                let mut ordering = Vec::new();
+                loop {
+                    let column_name = self.next_identifier()?; // 获取列名
+                    let ordering_type = match self.next_keyword() {
+                        // 获取排序方式
+                        Ok(Keyword::Asc) => Ordering::Asc,
+                        Ok(Keyword::Desc) => Ordering::Desc,
+                        Ok(keyword) => {
+                            return Err(ParseError(format!("Unexpected keyword {keyword}")))
+                        }
+                        Err(_) => Ordering::Asc, // 如果是 Err，可能是没有排序方式或者解析出现错误，则默认为 ASC
+                    };
+                    ordering.push((column_name, ordering_type));
+                    if self.next_token_equal(Token::Comma).is_err() {
+                        break;
+                    }
+                }
+                Ok(ordering)
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(Statement::Select {
+            table_name,
+            filter,
+            ordering,
+        })
     }
 
     /// 解析 UPDATE 语句
@@ -144,8 +184,8 @@ impl<'a> Parser<'a> {
         }
 
         // 如果有 WHERE 子句，则解析 WHERE 子句
-        let where_clause = if self
-            .next_token_if(|t| *t == Token::Keyword(Keyword::Where))
+        let filter = if self
+            .next_token_equal(Token::Keyword(Keyword::Where))
             .is_ok()
         {
             Some(self.parse_where_clause()?)
@@ -156,7 +196,7 @@ impl<'a> Parser<'a> {
         Ok(Statement::Update {
             table_name,
             columns,
-            where_clause,
+            filter,
         })
     }
 
@@ -181,16 +221,13 @@ impl<'a> Parser<'a> {
         let table_name = self.next_identifier()?;
 
         // 如果有 WHERE 子句，则解析 WHERE 子句
-        let where_clause = self
-            .next_token_if(|token| *token == Token::Keyword(Keyword::Where))
+        let filter = self
+            .next_token_equal(Token::Keyword(Keyword::Where))
             .ok()
             .map(|_| self.parse_where_clause())
             .transpose()?;
 
-        Ok(Statement::Delete {
-            table_name,
-            where_clause,
-        })
+        Ok(Statement::Delete { table_name, filter })
     }
 
     /// 解析列定义
@@ -395,12 +432,28 @@ mod tests {
 
     #[test]
     fn test_parse_select() {
+        let mut parser = Parser::new("SELECT * FROM table1 where id = 1 order by name desc, id;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                table_name: "table1".to_string(),
+                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                ordering: vec![
+                    ("name".to_string(), Ordering::Desc),
+                    ("id".to_string(), Ordering::Asc)
+                ],
+            }
+        );
+
         let mut parser = Parser::new("SELECT * FROM table1;");
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
             Statement::Select {
-                table_name: "table1".to_string()
+                table_name: "table1".to_string(),
+                filter: None,
+                ordering: vec![],
             }
         );
 
@@ -536,7 +589,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
             }
         );
 
@@ -555,7 +608,7 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
             }
         );
 
@@ -571,7 +624,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
             }
         );
 
@@ -587,7 +640,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                where_clause: None,
+                filter: None,
             }
         );
     }
@@ -600,7 +653,7 @@ mod tests {
             statement,
             Statement::Delete {
                 table_name: "table1".to_string(),
-                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1))),),
+                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1))),),
             }
         );
 
@@ -610,7 +663,7 @@ mod tests {
             statement,
             Statement::Delete {
                 table_name: "table1".to_string(),
-                where_clause: None,
+                filter: None,
             }
         );
     }

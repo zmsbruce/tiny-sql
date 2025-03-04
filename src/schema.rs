@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{cmp::Ordering, collections::HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use crate::{
 };
 
 /// 数据类型定义
-#[derive(PartialEq, Debug, Serialize, Deserialize)]
+#[derive(PartialEq, Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum DataType {
     Boolean,
     Integer,
@@ -35,6 +35,23 @@ pub enum Value {
     Integer(i64),
     Float(f64),
     String(String),
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Null, Self::Null) => Some(Ordering::Equal),
+            (Self::Null, _) => Some(Ordering::Less),
+            (_, Self::Null) => Some(Ordering::Greater),
+            (Self::Boolean(a), Self::Boolean(b)) => a.partial_cmp(b),
+            (Self::Integer(a), Self::Integer(b)) => a.partial_cmp(b),
+            (Self::Float(a), Self::Float(b)) => a.partial_cmp(b),
+            (Self::Integer(a), Self::Float(b)) => (*a as f64).partial_cmp(b),
+            (Self::Float(a), Self::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Self::String(a), Self::String(b)) => a.partial_cmp(b),
+            _ => None,
+        }
+    }
 }
 
 impl From<Expression> for Value {
@@ -95,6 +112,26 @@ impl Table {
                 "Table {} has more than one primary key",
                 name
             )));
+        }
+
+        // 检查主键是否为 nullable，如果是则返回错误
+        if columns[pk_indexes[0]].nullable {
+            return Err(InternalError(format!(
+                "Primary key {} cannot be nullable",
+                columns[pk_indexes[0]].name
+            )));
+        }
+
+        // 检查默认值是否和数据类型匹配
+        for col in &columns {
+            if let Some(default) = &col.default {
+                if default.data_type() != Some(col.data_type) {
+                    return Err(InternalError(format!(
+                        "Default value {:?} does not match column {}'s data type",
+                        default, col.name
+                    )));
+                }
+            }
         }
 
         // 创建列索引

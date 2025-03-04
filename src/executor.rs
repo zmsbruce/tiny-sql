@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     engine::{Engine, Transaction},
     error::{Error::InternalError, Result},
-    parser::ast::{Expression, Statement},
+    parser::ast::{Expression, Ordering, Statement},
     schema::{Row, Table, Value},
     storage::Storage,
 };
@@ -65,23 +65,25 @@ impl<S: Storage> Executor<S> {
                 self.insert(table_name, columns.unwrap_or_default(), values)?;
                 Ok(ExecuteResult::Insert)
             }
-            Statement::Select { table_name } => {
-                let (columns, rows) = self.scan(&table_name, None)?;
+            Statement::Select {
+                table_name,
+                filter,
+                ordering,
+            } => {
+                let (columns, rows) = self.select(table_name, filter, ordering)?;
+
                 Ok(ExecuteResult::Scan { columns, rows })
             }
             Statement::Update {
                 table_name,
                 columns,
-                where_clause,
+                filter,
             } => {
-                let count = self.update(table_name, columns, where_clause)?;
+                let count = self.update(table_name, columns, filter)?;
                 Ok(ExecuteResult::Update(count))
             }
-            Statement::Delete {
-                table_name,
-                where_clause,
-            } => {
-                let count = self.delete(table_name, where_clause)?;
+            Statement::Delete { table_name, filter } => {
+                let count = self.delete(table_name, filter)?;
                 Ok(ExecuteResult::Delete(count))
             }
         }
@@ -108,16 +110,29 @@ impl<S: Storage> Executor<S> {
         table_name: &str,
         filter: Option<(String, Expression)>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
-        let columns = self
+        let table = self
             .transaction
             .get_table(table_name)?
-            .ok_or(InternalError(format!("Table {table_name} not found")))?
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
+            .ok_or(InternalError(format!("Table {table_name} not found")))?;
+
+        let columns = table.columns.iter().map(|c| c.name.clone()).collect();
 
         let rows = self.transaction.scan_table(table_name, filter)?;
+
+        Ok((columns, rows))
+    }
+
+    /// 查询数据
+    fn select(
+        &self,
+        table_name: String,
+        filter: Option<(String, Expression)>,
+        ordering: Vec<(String, Ordering)>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let (columns, rows) = self.scan(&table_name, filter)?;
+
+        let mut rows = rows;
+        self.sort_rows(&mut rows, &columns, ordering);
 
         Ok((columns, rows))
     }
@@ -190,13 +205,13 @@ impl<S: Storage> Executor<S> {
         &self,
         table_name: String,
         columns: HashMap<String, Expression>,
-        where_clause: Option<(String, Expression)>,
+        filter: Option<(String, Expression)>,
     ) -> Result<usize> {
         let table = self
             .transaction
             .get_table(&table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
-        let (_, rows) = self.scan(&table_name, where_clause)?;
+        let (_, rows) = self.scan(&table_name, filter)?;
 
         let mut updated_count = 0;
         for row in rows {
@@ -218,16 +233,13 @@ impl<S: Storage> Executor<S> {
         Ok(updated_count)
     }
 
-    fn delete(
-        &self,
-        table_name: String,
-        where_clause: Option<(String, Expression)>,
-    ) -> Result<usize> {
+    /// 删除数据
+    fn delete(&self, table_name: String, filter: Option<(String, Expression)>) -> Result<usize> {
         let table = self
             .transaction
             .get_table(&table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
-        let (_, rows) = self.scan(&table_name, where_clause)?;
+        let (_, rows) = self.scan(&table_name, filter)?;
 
         let mut delete_count = 0;
         for row in rows {
@@ -237,6 +249,32 @@ impl<S: Storage> Executor<S> {
         }
 
         Ok(delete_count)
+    }
+
+    /// 对行进行排序
+    fn sort_rows(&self, rows: &mut [Row], columns: &[String], ordering: Vec<(String, Ordering)>) {
+        let col_indices = columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| (col.clone(), i))
+            .collect::<HashMap<String, usize>>();
+
+        rows.sort_by(|lhs, rhs| {
+            for (col_name, order) in ordering.iter() {
+                let col_idx = col_indices.get(col_name).unwrap();
+                match lhs[*col_idx].partial_cmp(&rhs[*col_idx]) {
+                    Some(ord) if ord != std::cmp::Ordering::Equal => {
+                        return if *order == Ordering::Asc {
+                            ord
+                        } else {
+                            ord.reverse()
+                        };
+                    }
+                    _ => continue,
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
     }
 }
 
@@ -318,15 +356,17 @@ mod tests {
 
         let stmt = Statement::Select {
             table_name: "users".to_string(),
+            filter: None,
+            ordering: vec![("id".to_string(), Ordering::Desc)],
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
                 vec![
-                    vec![Value::Integer(1), Value::String("Alice".to_string())],
-                    vec![Value::Integer(2), Value::Null],
                     vec![Value::Integer(3), Value::String("Momo".to_string())],
+                    vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(1), Value::String("Alice".to_string())],
                 ]
             );
         } else {
@@ -341,7 +381,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            where_clause: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
         };
         let result = executor.execute(stmt)?;
         if let ExecuteResult::Update(count) = result {
@@ -352,14 +392,16 @@ mod tests {
 
         let stmt = Statement::Select {
             table_name: "users".to_string(),
+            filter: None,
+            ordering: vec![("name".to_string(), Ordering::Asc)],
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
                 vec![
-                    vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(3), Value::String("Momo".to_string())],
                 ]
             );
@@ -369,7 +411,7 @@ mod tests {
 
         let stmt = Statement::Delete {
             table_name: "users".to_string(),
-            where_clause: Some(("id".to_string(), Expression::Constant(Constant::Integer(2)))),
+            filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(2)))),
         };
         let result = executor.execute(stmt)?;
         if let ExecuteResult::Delete(count) = result {
@@ -380,15 +422,14 @@ mod tests {
 
         let stmt = Statement::Select {
             table_name: "users".to_string(),
+            filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(3)))),
+            ordering: vec![],
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
-                vec![
-                    vec![Value::Integer(1), Value::String("Bob".to_string())],
-                    vec![Value::Integer(3), Value::String("Momo".to_string())],
-                ]
+                vec![vec![Value::Integer(3), Value::String("Momo".to_string())],]
             );
         } else {
             panic!("Expect ExecuteResult::Scan");
@@ -445,16 +486,16 @@ mod tests {
             panic!("Expect ExecuteResult::Update");
         }
 
-        let sql = "SELECT * FROM users;";
+        let sql = "SELECT * FROM users ORDER BY name DESC;";
         let stmt = parse_sql(sql)?;
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
                 vec![
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
                     vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(2), Value::Null],
-                    vec![Value::Integer(3), Value::String("Momo".to_string())],
                 ]
             );
         } else {
@@ -470,16 +511,13 @@ mod tests {
             panic!("Expect ExecuteResult::Delete");
         }
 
-        let sql = "SELECT * FROM users;";
+        let sql = "SELECT * FROM users WHERE id = 3;";
         let stmt = parse_sql(sql)?;
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
-                vec![
-                    vec![Value::Integer(1), Value::String("Bob".to_string())],
-                    vec![Value::Integer(3), Value::String("Momo".to_string())],
-                ]
+                vec![vec![Value::Integer(3), Value::String("Momo".to_string())],]
             );
         } else {
             panic!("Expect ExecuteResult::Scan");

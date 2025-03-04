@@ -26,6 +26,13 @@ impl From<Constant> for Expression {
     }
 }
 
+/// 排序方式
+#[derive(PartialEq, Debug)]
+pub enum Ordering {
+    Asc,
+    Desc,
+}
+
 /// 抽象语法树定义。支持的 SQL 语法：
 ///
 /// * `create table [table_name];`
@@ -44,14 +51,16 @@ pub enum Statement {
     },
     Select {
         table_name: String,
+        filter: Option<(String, Expression)>,
+        ordering: Vec<(String, Ordering)>,
     },
     Update {
         table_name: String,
         columns: HashMap<String, Expression>,
-        where_clause: Option<(String, Expression)>,
+        filter: Option<(String, Expression)>,
     },
     Delete {
         table_name: String,
-        where_clause: Option<(String, Expression)>,
+        filter: Option<(String, Expression)>,
     },
 }
