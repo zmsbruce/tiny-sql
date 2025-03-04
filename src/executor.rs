@@ -16,6 +16,7 @@ pub enum ExecuteResult {
         rows: Vec<Row>,
     },
     Update(usize),
+    Delete(usize),
 }
 
 /// SQL 执行器
@@ -75,6 +76,13 @@ impl<S: Storage> Executor<S> {
             } => {
                 let count = self.update(table_name, columns, where_clause)?;
                 Ok(ExecuteResult::Update(count))
+            }
+            Statement::Delete {
+                table_name,
+                where_clause,
+            } => {
+                let count = self.delete(table_name, where_clause)?;
+                Ok(ExecuteResult::Delete(count))
             }
         }
     }
@@ -209,6 +217,27 @@ impl<S: Storage> Executor<S> {
 
         Ok(updated_count)
     }
+
+    fn delete(
+        &self,
+        table_name: String,
+        where_clause: Option<(String, Expression)>,
+    ) -> Result<usize> {
+        let table = self
+            .transaction
+            .get_table(&table_name)?
+            .ok_or(InternalError(format!("Table {table_name} not found")))?;
+        let (_, rows) = self.scan(&table_name, where_clause)?;
+
+        let mut delete_count = 0;
+        for row in rows {
+            let primary_key = table.get_primary_key(&row);
+            self.transaction.delete_row(&table, primary_key)?;
+            delete_count += 1;
+        }
+
+        Ok(delete_count)
+    }
 }
 
 #[cfg(test)]
@@ -338,6 +367,33 @@ mod tests {
             panic!("Expect ExecuteResult::Scan");
         }
 
+        let stmt = Statement::Delete {
+            table_name: "users".to_string(),
+            where_clause: Some(("id".to_string(), Expression::Constant(Constant::Integer(2)))),
+        };
+        let result = executor.execute(stmt)?;
+        if let ExecuteResult::Delete(count) = result {
+            assert_eq!(count, 1);
+        } else {
+            panic!("Expect ExecuteResult::Delete");
+        }
+
+        let stmt = Statement::Select {
+            table_name: "users".to_string(),
+        };
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::String("Bob".to_string())],
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
+                ]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
         Ok(())
     }
 
@@ -398,6 +454,30 @@ mod tests {
                 vec![
                     vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(2), Value::Null],
+                    vec![Value::Integer(3), Value::String("Momo".to_string())],
+                ]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
+        let sql = "DELETE FROM users WHERE id = 2;";
+        let stmt = parse_sql(sql)?;
+        let result = executor.execute(stmt)?;
+        if let ExecuteResult::Delete(count) = result {
+            assert_eq!(count, 1);
+        } else {
+            panic!("Expect ExecuteResult::Delete");
+        }
+
+        let sql = "SELECT * FROM users;";
+        let stmt = parse_sql(sql)?;
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(3), Value::String("Momo".to_string())],
                 ]
             );

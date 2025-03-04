@@ -72,6 +72,7 @@ pub enum Keyword {
     Update,
     Set,
     Where,
+    Delete,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -106,6 +107,7 @@ impl TryFrom<&str> for Keyword {
             "UPDATE" => Keyword::Update,
             "SET" => Keyword::Set,
             "WHERE" => Keyword::Where,
+            "DELETE" => Keyword::Delete,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -150,6 +152,7 @@ impl Display for Keyword {
             Keyword::Update => "UPDATE",
             Keyword::Set => "SET",
             Keyword::Where => "WHERE",
+            Keyword::Delete => "DELETE",
         })
     }
 }

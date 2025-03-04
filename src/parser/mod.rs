@@ -31,6 +31,7 @@ impl<'a> Parser<'a> {
     /// - create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     /// - insert into [table_name] ([column_name], ...) values ([value], ...);
     /// - update [table_name] set [column_name] = [value], ... where [condition];
+    /// - delete from [table_name] where [condition];
     pub fn parse(&mut self) -> Result<Statement> {
         // 根据第一个 token 的类型选择解析方法
         let stmt = match self
@@ -42,6 +43,7 @@ impl<'a> Parser<'a> {
             Ok(Token::Keyword(Keyword::Create)) => self.parse_create_table(),
             Ok(Token::Keyword(Keyword::Insert)) => self.parse_insert(),
             Ok(Token::Keyword(Keyword::Update)) => self.parse_update(),
+            Ok(Token::Keyword(Keyword::Delete)) => self.parse_delete(),
             Ok(token) => Err(ParseError(format!("Unexpected token {token}"))),
             Err(e) => Err(ParseError(format!("Lexical error: {e}"))),
         };
@@ -167,6 +169,28 @@ impl<'a> Parser<'a> {
         self.next_token_equal(Token::Equal)?;
         let val = self.parse_expression()?;
         Ok((col_name, val))
+    }
+
+    /// 解析 DELETE 语句
+    ///
+    /// 语法：DELETE FROM [table_name] WHERE [condition];
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.next_token_equal(Token::Keyword(Keyword::Delete))?;
+        self.next_token_equal(Token::Keyword(Keyword::From))?;
+
+        let table_name = self.next_identifier()?;
+
+        // 如果有 WHERE 子句，则解析 WHERE 子句
+        let where_clause = self
+            .next_token_if(|token| *token == Token::Keyword(Keyword::Where))
+            .ok()
+            .map(|_| self.parse_where_clause())
+            .transpose()?;
+
+        Ok(Statement::Delete {
+            table_name,
+            where_clause,
+        })
     }
 
     /// 解析列定义
@@ -563,6 +587,29 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                where_clause: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_delete() {
+        let mut parser = Parser::new("DELETE FROM table1 WHERE id = 1");
+        let statement = parser.parse_delete().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Delete {
+                table_name: "table1".to_string(),
+                where_clause: Some(("id".to_string(), Expression::from(Constant::Integer(1))),),
+            }
+        );
+
+        parser = Parser::new("DELETE FROM table1");
+        let statement = parser.parse_delete().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Delete {
+                table_name: "table1".to_string(),
                 where_clause: None,
             }
         );

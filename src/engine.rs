@@ -170,6 +170,14 @@ impl<S: Storage> Transaction<S> {
         Ok(())
     }
 
+    /// 删除行数据
+    pub fn delete_row(&self, table: &Table, pk: &Value) -> Result<()> {
+        let key = Key::Row(table.name.clone(), pk.clone());
+        self.txn.delete(&bincode::serialize(&key)?)?;
+
+        Ok(())
+    }
+
     /// 提交事务
     #[inline]
     pub fn commit(&self) -> Result<()> {
@@ -257,5 +265,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows_scan.len(), 1);
+
+        txn.update_row(
+            &table,
+            &Value::Integer(42),
+            &vec![Value::Integer(42), Value::String("zmsbruceee".to_string())],
+        )
+        .unwrap();
+        let rows_scan = txn.scan_table("users", None).unwrap();
+        assert_eq!(
+            rows_scan,
+            vec![
+                vec![Value::Integer(42), Value::String("zmsbruceee".to_string())],
+                vec![
+                    Value::Integer(114514),
+                    Value::String("Tadokoro".to_string())
+                ],
+            ]
+        );
+
+        txn.delete_row(&table, &Value::Integer(42)).unwrap();
+        let rows_scan = txn.scan_table("users", None).unwrap();
+        assert_eq!(
+            rows_scan,
+            vec![vec![
+                Value::Integer(114514),
+                Value::String("Tadokoro".to_string())
+            ]]
+        );
     }
 }
