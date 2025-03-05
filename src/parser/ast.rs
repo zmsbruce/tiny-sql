@@ -53,6 +53,8 @@ pub enum Statement {
         table_name: String,
         filter: Option<(String, Expression)>,
         ordering: Vec<(String, Ordering)>,
+        limit: Option<Expression>,
+        offset: Option<Expression>,
     },
     Update {
         table_name: String,

@@ -27,11 +27,18 @@ impl<'a> Parser<'a> {
     /// 解析 SQL 语句
     ///
     /// 支持的语句：
-    /// - select * from [table_name] [where [condition]] [order by [column_name] [asc|desc]];
-    /// - create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
-    /// - insert into [table_name] ([column_name], ...) values ([value], ...);
-    /// - update [table_name] set [column_name] = [value], ... where [condition];
-    /// - delete from [table_name] where [condition];
+    ///
+    /// ```sql
+    /// select * from [table_name] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
+    ///
+    /// create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
+    ///
+    /// insert into [table_name] ([column_name], ...) values ([value], ...);
+    ///
+    /// update [table_name] set [column_name] = [value], ... where [condition];
+    ///
+    /// delete from [table_name] where [condition];
+    /// ```
     pub fn parse(&mut self) -> Result<Statement> {
         // 根据第一个 token 的类型选择解析方法
         let stmt = match self
@@ -104,7 +111,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 SELECT 语句
-    /// 语法：SELECT * FROM [table_name];
+    /// 语法：`SELECT * FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
     fn parse_select(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Select))?; // 期望下一个 token 是 SELECT
         self.next_token_equal(Token::Asterisk)?; // 期望下一个 token 是 *
@@ -128,34 +135,49 @@ impl<'a> Parser<'a> {
                 let mut ordering = Vec::new();
                 loop {
                     let column_name = self.next_identifier()?; // 获取列名
-                    let ordering_type = match self.next_keyword() {
+                    let ordering_type = match self.next_token_if(|token| {
+                        matches!(
+                            token,
+                            Token::Keyword(Keyword::Asc) | Token::Keyword(Keyword::Desc)
+                        )
+                    }) {
                         // 获取排序方式
-                        Ok(Keyword::Asc) => Ordering::Asc,
-                        Ok(Keyword::Desc) => Ordering::Desc,
-                        Ok(keyword) => {
-                            return Err(ParseError(format!("Unexpected keyword {keyword}")))
-                        }
-                        Err(_) => Ordering::Asc, // 如果是 Err，可能是没有排序方式或者解析出现错误，则默认为 ASC
+                        Ok(Token::Keyword(Keyword::Asc)) => Ordering::Asc,
+                        Ok(Token::Keyword(Keyword::Desc)) => Ordering::Desc,
+                        _ => Ordering::Asc, // 如果不是 ASC 或 DESC，则默认为 ASC
                     };
                     ordering.push((column_name, ordering_type));
                     if self.next_token_equal(Token::Comma).is_err() {
                         break;
                     }
                 }
-                Ok(ordering)
+                Ok::<_, crate::Error>(ordering)
             })
             .transpose()?
             .unwrap_or_default();
+
+        let limit = self
+            .next_token_equal(Token::Keyword(Keyword::Limit))
+            .ok()
+            .map(|_| self.parse_expression())
+            .transpose()?;
+        let offset = self
+            .next_token_equal(Token::Keyword(Keyword::Offset))
+            .ok()
+            .map(|_| self.parse_expression())
+            .transpose()?;
 
         Ok(Statement::Select {
             table_name,
             filter,
             ordering,
+            limit,
+            offset,
         })
     }
 
     /// 解析 UPDATE 语句
-    /// 语法：UPDATE [table_name] SET [column_name] = [value], ... WHERE [condition];
+    /// 语法：`UPDATE [table_name] SET [column_name] = [value], ... WHERE [condition];`
     fn parse_update(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Update))?;
 
@@ -201,7 +223,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 WHERE 子句
-    /// 语法：WHERE column_name = expression
+    /// 语法：`WHERE column_name = expression`
     ///
     /// 目前只支持单个表达式且仅为等于操作，不支持其他操作符和表达式组合
     fn parse_where_clause(&mut self) -> Result<(String, Expression)> {
@@ -213,7 +235,7 @@ impl<'a> Parser<'a> {
 
     /// 解析 DELETE 语句
     ///
-    /// 语法：DELETE FROM [table_name] WHERE [condition];
+    /// 语法：`DELETE FROM [table_name] WHERE [condition];`
     fn parse_delete(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Delete))?;
         self.next_token_equal(Token::Keyword(Keyword::From))?;
@@ -334,7 +356,7 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 INSERT 语句
-    /// 语法：INSERT INTO [table_name] ([column_name], ...) VALUES ([value], ...);
+    /// 语法：`INSERT INTO [table_name] ([column_name], ...) VALUES ([value], ...);`
     fn parse_insert(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Insert))?; // 期望下一个 token 是 INSERT
         self.next_token_equal(Token::Keyword(Keyword::Into))?; // 期望下一个 token 是 INTO
@@ -432,7 +454,9 @@ mod tests {
 
     #[test]
     fn test_parse_select() {
-        let mut parser = Parser::new("SELECT * FROM table1 where id = 1 order by name desc, id;");
+        let mut parser = Parser::new(
+            "SELECT * FROM table1 where id = 1 order by name desc, id limit 5 offset 1;",
+        );
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
@@ -443,6 +467,8 @@ mod tests {
                     ("name".to_string(), Ordering::Desc),
                     ("id".to_string(), Ordering::Asc)
                 ],
+                limit: Some(Expression::from(Constant::Integer(5))),
+                offset: Some(Expression::from(Constant::Integer(1))),
             }
         );
 
@@ -454,6 +480,8 @@ mod tests {
                 table_name: "table1".to_string(),
                 filter: None,
                 ordering: vec![],
+                limit: None,
+                offset: None,
             }
         );
 

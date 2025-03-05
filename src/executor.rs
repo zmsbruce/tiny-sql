@@ -69,8 +69,10 @@ impl<S: Storage> Executor<S> {
                 table_name,
                 filter,
                 ordering,
+                limit,
+                offset,
             } => {
-                let (columns, rows) = self.select(table_name, filter, ordering)?;
+                let (columns, rows) = self.select(table_name, filter, ordering, limit, offset)?;
 
                 Ok(ExecuteResult::Scan { columns, rows })
             }
@@ -128,11 +130,33 @@ impl<S: Storage> Executor<S> {
         table_name: String,
         filter: Option<(String, Expression)>,
         ordering: Vec<(String, Ordering)>,
+        limit: Option<Expression>,
+        offset: Option<Expression>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         let (columns, rows) = self.scan(&table_name, filter)?;
 
         let mut rows = rows;
         self.sort_rows(&mut rows, &columns, ordering);
+
+        if offset.is_none() && limit.is_none() {
+            return Ok((columns, rows));
+        }
+
+        let offset = offset.map_or(Ok(0), |offset_expr| match Value::from(offset_expr) {
+            Value::Integer(offset) if offset >= 0 => Ok(offset as usize),
+            other => Err(InternalError(format!(
+                "Offset must be a non-negative integer, get {:?}",
+                other
+            ))),
+        })?;
+        let limit = limit.map_or(Ok(rows.len()), |limit_expr| match Value::from(limit_expr) {
+            Value::Integer(limit) if limit >= 0 => Ok(limit as usize),
+            other => Err(InternalError(format!(
+                "Limit must be a non-negative integer, get {:?}",
+                other
+            ))),
+        })?;
+        let rows = rows.into_iter().skip(offset).take(limit).collect();
 
         Ok((columns, rows))
     }
@@ -358,6 +382,8 @@ mod tests {
             table_name: "users".to_string(),
             filter: None,
             ordering: vec![("id".to_string(), Ordering::Desc)],
+            limit: None,
+            offset: None,
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
@@ -394,13 +420,14 @@ mod tests {
             table_name: "users".to_string(),
             filter: None,
             ordering: vec![("name".to_string(), Ordering::Asc)],
+            limit: Some(Expression::Constant(Constant::Integer(2))),
+            offset: Some(Expression::Constant(Constant::Integer(1))),
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
                 vec![
-                    vec![Value::Integer(2), Value::Null],
                     vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(3), Value::String("Momo".to_string())],
                 ]
@@ -424,6 +451,8 @@ mod tests {
             table_name: "users".to_string(),
             filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(3)))),
             ordering: vec![],
+            limit: None,
+            offset: None,
         };
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
@@ -486,14 +515,13 @@ mod tests {
             panic!("Expect ExecuteResult::Update");
         }
 
-        let sql = "SELECT * FROM users ORDER BY name DESC;";
+        let sql = "SELECT * FROM users ORDER BY name DESC LIMIT 2 OFFSET 1;";
         let stmt = parse_sql(sql)?;
         if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(
                 rows,
                 vec![
-                    vec![Value::Integer(3), Value::String("Momo".to_string())],
                     vec![Value::Integer(1), Value::String("Bob".to_string())],
                     vec![Value::Integer(2), Value::Null],
                 ]
