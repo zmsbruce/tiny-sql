@@ -29,7 +29,7 @@ impl<'a> Parser<'a> {
     /// 支持的语句：
     ///
     /// ```sql
-    /// select * from [table_name] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
+    /// select [* | col_name [ [ AS ] output_name [, ...] ]] from [table_name] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
     ///
     /// create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     ///
@@ -111,10 +111,27 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 SELECT 语句
-    /// 语法：`SELECT * FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
+    /// 语法：`SELECT [* | col_name [ [ AS ] output_name [, ...] ]] FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
     fn parse_select(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Select))?; // 期望下一个 token 是 SELECT
-        self.next_token_equal(Token::Asterisk)?; // 期望下一个 token 是 *
+
+        // 获取列名，如果是 *，则表示选择所有列
+        let mut columns = Vec::new();
+        if self.next_token_equal(Token::Asterisk).is_err() {
+            loop {
+                let column_name = self.next_identifier()?; // 获取列名
+                let alias = self
+                    .next_token_if(|token| matches!(token, Token::Keyword(Keyword::As)))
+                    .ok()
+                    .map(|_| self.next_identifier())
+                    .transpose()?; // 获取列的别名
+                columns.push((column_name, alias));
+                if self.next_token_equal(Token::Comma).is_err() {
+                    break;
+                }
+            }
+        }
+
         self.next_token_equal(Token::Keyword(Keyword::From))?; // 期望下一个 token 是 FROM
 
         let table_name = self.next_identifier()?; // 获取表名
@@ -168,6 +185,7 @@ impl<'a> Parser<'a> {
             .transpose()?;
 
         Ok(Statement::Select {
+            columns,
             table_name,
             filter,
             ordering,
@@ -455,12 +473,16 @@ mod tests {
     #[test]
     fn test_parse_select() {
         let mut parser = Parser::new(
-            "SELECT * FROM table1 where id = 1 order by name desc, id limit 5 offset 1;",
+            "SELECT name AS user_name, id AS user_id FROM table1 where id = 1 order by name desc, id limit 5 offset 1;",
         );
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
             Statement::Select {
+                columns: vec![
+                    ("name".to_string(), Some("user_name".to_string())),
+                    ("id".to_string(), Some("user_id".to_string())),
+                ],
                 table_name: "table1".to_string(),
                 filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
                 ordering: vec![
@@ -477,6 +499,7 @@ mod tests {
         assert_eq!(
             statement,
             Statement::Select {
+                columns: vec![],
                 table_name: "table1".to_string(),
                 filter: None,
                 ordering: vec![],

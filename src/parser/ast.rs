@@ -13,7 +13,6 @@ pub enum Constant {
 }
 
 /// 表达式定义
-/// 目前只支持常量，后续会支持计算表达式
 #[derive(PartialEq, Debug, Clone)]
 pub enum Expression {
     Constant(Constant),
@@ -33,11 +32,7 @@ pub enum Ordering {
     Desc,
 }
 
-/// 抽象语法树定义。支持的 SQL 语法：
-///
-/// * `create table [table_name];`
-/// * `insert into [table_name] [values];`
-/// * `select * from [table_name];`
+/// 抽象语法树定义
 #[derive(PartialEq, Debug)]
 pub enum Statement {
     CreateTable {
@@ -50,6 +45,7 @@ pub enum Statement {
         values: Vec<Vec<Expression>>,
     },
     Select {
+        columns: Vec<(String, Option<String>)>,
         table_name: String,
         filter: Option<(String, Expression)>,
         ordering: Vec<(String, Ordering)>,
