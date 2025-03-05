@@ -80,6 +80,8 @@ pub enum Keyword {
     Limit,
     Offset,
     As,
+    Cross,
+    Join,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -122,6 +124,8 @@ impl TryFrom<&str> for Keyword {
             "LIMIT" => Keyword::Limit,
             "OFFSET" => Keyword::Offset,
             "AS" => Keyword::As,
+            "CROSS" => Keyword::Cross,
+            "JOIN" => Keyword::Join,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -174,6 +178,8 @@ impl Display for Keyword {
             Keyword::Limit => "LIMIT",
             Keyword::Offset => "OFFSET",
             Keyword::As => "AS",
+            Keyword::Cross => "CROSS",
+            Keyword::Join => "JOIN",
         })
     }
 }

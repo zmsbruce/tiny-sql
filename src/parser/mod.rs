@@ -5,7 +5,7 @@ use crate::{
     Error::ParseError,
     Result,
 };
-use ast::{Constant, Expression, Ordering, Statement};
+use ast::{Constant, Expression, JoinType, Ordering, SelectFrom, Statement};
 use lexer::{Keyword, Lexer, Token};
 
 pub mod ast;
@@ -111,11 +111,78 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 SELECT 语句
-    /// 语法：`SELECT [* | col_name [ [ AS ] output_name [, ...] ]] FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
+    /// 语法：`SELECT [* | col_name [ [AS] output_name [, ...] ]] FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
     fn parse_select(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Select))?; // 期望下一个 token 是 SELECT
 
         // 获取列名，如果是 *，则表示选择所有列
+        let columns = self.parse_select_columns()?;
+
+        let from = self.parse_select_from()?; // 解析 FROM 子句
+
+        // 如果有 WHERE 子句，则解析 WHERE 子句
+        let filter = self
+            .next_token_equal(Token::Keyword(Keyword::Where))
+            .ok()
+            .map(|_| self.parse_where_clause())
+            .transpose()?;
+
+        // 如果有 ORDER BY 子句，则解析 ORDER BY 子句
+        let ordering = self.parse_order_by()?.unwrap_or_default();
+
+        let limit = self
+            .next_token_equal(Token::Keyword(Keyword::Limit))
+            .ok()
+            .map(|_| self.parse_expression())
+            .transpose()?;
+        let offset = self
+            .next_token_equal(Token::Keyword(Keyword::Offset))
+            .ok()
+            .map(|_| self.parse_expression())
+            .transpose()?;
+
+        Ok(Statement::Select {
+            columns,
+            from,
+            filter,
+            ordering,
+            limit,
+            offset,
+        })
+    }
+
+    /// 解析 SELECT 语句的 FROM 子句
+    /// 语法：`FROM table_name [CROSS JOIN table_name ...]`
+    fn parse_select_from(&mut self) -> Result<SelectFrom> {
+        self.next_token_equal(Token::Keyword(Keyword::From))?; // 期望下一个 token 是 FROM
+
+        let mut select_from = SelectFrom::Table {
+            name: self.next_identifier()?, // 第一个表名
+        };
+
+        // 如果有 JOIN 子句，则解析 JOIN 子句
+        while self
+            .next_token_equal(Token::Keyword(Keyword::Cross))
+            .is_ok()
+        {
+            self.next_token_equal(Token::Keyword(Keyword::Join))?; // 期望下一个 token 是 JOIN
+            let right = SelectFrom::Table {
+                name: self.next_identifier()?, // 获取右表名
+            };
+            let join_type = JoinType::Full; // 默认为 FULL JOIN
+            select_from = SelectFrom::Join {
+                left: Box::new(select_from),
+                right: Box::new(right),
+                join_type,
+            };
+        }
+
+        Ok(select_from)
+    }
+
+    /// 解析 SELECT 语句的列名
+    /// 语法：`[* | col_name [ [AS] output_name [, ...] ]`
+    fn parse_select_columns(&mut self) -> Result<Vec<(String, Option<String>)>> {
         let mut columns = Vec::new();
         if self.next_token_equal(Token::Asterisk).is_err() {
             loop {
@@ -131,21 +198,13 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        Ok(columns)
+    }
 
-        self.next_token_equal(Token::Keyword(Keyword::From))?; // 期望下一个 token 是 FROM
-
-        let table_name = self.next_identifier()?; // 获取表名
-
-        // 如果有 WHERE 子句，则解析 WHERE 子句
-        let filter = self
-            .next_token_equal(Token::Keyword(Keyword::Where))
-            .ok()
-            .map(|_| self.parse_where_clause())
-            .transpose()?;
-
-        // 如果有 ORDER BY 子句，则解析 ORDER BY 子句
-        let ordering = self
-            .next_token_equal(Token::Keyword(Keyword::Order))
+    /// 解析 ORDER BY 子句，可能不存在
+    /// 语法：`ORDER BY [column_name] [ASC|DESC], ...`
+    fn parse_order_by(&mut self) -> Result<Option<Vec<(String, Ordering)>>> {
+        self.next_token_equal(Token::Keyword(Keyword::Order))
             .ok()
             .map(|_| {
                 self.next_token_equal(Token::Keyword(Keyword::By))?; // 期望下一个 token 是 BY
@@ -170,28 +229,7 @@ impl<'a> Parser<'a> {
                 }
                 Ok::<_, crate::Error>(ordering)
             })
-            .transpose()?
-            .unwrap_or_default();
-
-        let limit = self
-            .next_token_equal(Token::Keyword(Keyword::Limit))
-            .ok()
-            .map(|_| self.parse_expression())
-            .transpose()?;
-        let offset = self
-            .next_token_equal(Token::Keyword(Keyword::Offset))
-            .ok()
-            .map(|_| self.parse_expression())
-            .transpose()?;
-
-        Ok(Statement::Select {
-            columns,
-            table_name,
-            filter,
-            ordering,
-            limit,
-            offset,
-        })
+            .transpose()
     }
 
     /// 解析 UPDATE 语句
@@ -471,9 +509,118 @@ mod tests {
     }
 
     #[test]
+    fn test_order_by() {
+        let mut parser = Parser::new("ORDER BY name ASC, id DESC;");
+        let ordering = parser.parse_order_by().unwrap().unwrap();
+        assert_eq!(
+            ordering,
+            vec![
+                ("name".to_string(), Ordering::Asc),
+                ("id".to_string(), Ordering::Desc)
+            ]
+        );
+
+        parser = Parser::new("ORDER BY name, id;");
+        let ordering = parser.parse_order_by().unwrap().unwrap();
+        assert_eq!(
+            ordering,
+            vec![
+                ("name".to_string(), Ordering::Asc),
+                ("id".to_string(), Ordering::Asc)
+            ]
+        );
+
+        parser = Parser::new("ORDER BY name;");
+        let ordering = parser.parse_order_by().unwrap().unwrap();
+        assert_eq!(ordering, vec![("name".to_string(), Ordering::Asc)]);
+    }
+
+    #[test]
+    fn test_select_columns() {
+        let mut parser = Parser::new("name, id");
+        let columns = parser.parse_select_columns().unwrap();
+        assert_eq!(
+            columns,
+            vec![("name".to_string(), None), ("id".to_string(), None)]
+        );
+
+        parser = Parser::new("name AS user_name, id AS user_id");
+        let columns = parser.parse_select_columns().unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("name".to_string(), Some("user_name".to_string())),
+                ("id".to_string(), Some("user_id".to_string()))
+            ]
+        );
+
+        parser = Parser::new("*");
+        let columns = parser.parse_select_columns().unwrap();
+        assert_eq!(columns, vec![]);
+
+        parser = Parser::new("name AS user_name, id");
+        let columns = parser.parse_select_columns().unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("name".to_string(), Some("user_name".to_string())),
+                ("id".to_string(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_select_from() {
+        let mut parser = Parser::new("FROM table1");
+        let from = parser.parse_select_from().unwrap();
+        assert_eq!(
+            from,
+            SelectFrom::Table {
+                name: "table1".to_string()
+            }
+        );
+
+        parser = Parser::new("FROM table1 CROSS JOIN table2");
+        let from = parser.parse_select_from().unwrap();
+        assert_eq!(
+            from,
+            SelectFrom::Join {
+                left: Box::new(SelectFrom::Table {
+                    name: "table1".to_string()
+                }),
+                right: Box::new(SelectFrom::Table {
+                    name: "table2".to_string()
+                }),
+                join_type: JoinType::Full,
+            }
+        );
+
+        parser = Parser::new("FROM table1 CROSS JOIN table2 CROSS JOIN table3");
+        let from = parser.parse_select_from().unwrap();
+        assert_eq!(
+            from,
+            SelectFrom::Join {
+                left: Box::new(SelectFrom::Join {
+                    left: Box::new(SelectFrom::Table {
+                        name: "table1".to_string()
+                    }),
+                    right: Box::new(SelectFrom::Table {
+                        name: "table2".to_string()
+                    }),
+                    join_type: JoinType::Full,
+                }),
+                right: Box::new(SelectFrom::Table {
+                    name: "table3".to_string()
+                }),
+                join_type: JoinType::Full,
+            }
+        );
+    }
+
+    #[test]
     fn test_parse_select() {
         let mut parser = Parser::new(
-            "SELECT name AS user_name, id AS user_id FROM table1 where id = 1 order by name desc, id limit 5 offset 1;",
+            "SELECT name AS user_name, id AS user_id FROM table1 CROSS JOIN table2 where id = 1 order by name desc, id limit 5 offset 1;",
         );
         let statement = parser.parse_select().unwrap();
         assert_eq!(
@@ -483,7 +630,15 @@ mod tests {
                     ("name".to_string(), Some("user_name".to_string())),
                     ("id".to_string(), Some("user_id".to_string())),
                 ],
-                table_name: "table1".to_string(),
+                from: SelectFrom::Join {
+                    left: Box::new(SelectFrom::Table {
+                        name: "table1".to_string()
+                    }),
+                    right: Box::new(SelectFrom::Table {
+                        name: "table2".to_string()
+                    }),
+                    join_type: JoinType::Full,
+                },
                 filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
                 ordering: vec![
                     ("name".to_string(), Ordering::Desc),
@@ -500,7 +655,9 @@ mod tests {
             statement,
             Statement::Select {
                 columns: vec![],
-                table_name: "table1".to_string(),
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
                 filter: None,
                 ordering: vec![],
                 limit: None,

@@ -123,14 +123,11 @@ impl<S: Storage> Transaction<S> {
     /// 扫描表
     pub fn scan_table(
         &self,
-        table_name: &str,
+        table: &Table,
         filter: Option<(String, Expression)>,
     ) -> Result<Vec<Row>> {
-        let prefix = KeyPrefix::Row(table_name.to_string());
+        let prefix = KeyPrefix::Row(table.name.clone());
         let result = self.txn.scan_prefix(&bincode::serialize(&prefix)?)?;
-        let table = self
-            .get_table(table_name)?
-            .ok_or(InternalError(format!("Table {table_name} not found")))?;
 
         let mut rows = Vec::new();
         for (_, value) in result {
@@ -139,7 +136,7 @@ impl<S: Storage> Transaction<S> {
             if let Some((col, expr)) = &filter {
                 let col_idx = table.get_col_idx(col).ok_or(InternalError(format!(
                     "Column {} not found in table {}",
-                    col, table_name
+                    col, table.name
                 )))?;
                 if Value::from(expr.clone()) != row[col_idx] {
                     continue;
@@ -252,12 +249,12 @@ mod tests {
             txn.create_row("users", row).unwrap();
         }
 
-        let rows_scan = txn.scan_table("users", None).unwrap();
+        let rows_scan = txn.scan_table(&table, None).unwrap();
         assert_eq!(rows_scan, rows);
 
         let rows_scan = txn
             .scan_table(
-                "users",
+                &table,
                 Some((
                     "id".to_string(),
                     Expression::Constant(Constant::Integer(42)),
@@ -272,7 +269,7 @@ mod tests {
             &vec![Value::Integer(42), Value::String("zmsbruceee".to_string())],
         )
         .unwrap();
-        let rows_scan = txn.scan_table("users", None).unwrap();
+        let rows_scan = txn.scan_table(&table, None).unwrap();
         assert_eq!(
             rows_scan,
             vec![
@@ -285,7 +282,7 @@ mod tests {
         );
 
         txn.delete_row(&table, &Value::Integer(42)).unwrap();
-        let rows_scan = txn.scan_table("users", None).unwrap();
+        let rows_scan = txn.scan_table(&table, None).unwrap();
         assert_eq!(
             rows_scan,
             vec![vec![

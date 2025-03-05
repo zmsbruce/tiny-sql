@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::{
     engine::{Engine, Transaction},
     error::{Error::InternalError, Result},
-    parser::ast::{Expression, Ordering, Statement},
+    parser::ast::{Expression, JoinType, Ordering, SelectFrom, Statement},
     schema::{Row, Table, Value},
     storage::Storage,
 };
@@ -67,14 +67,14 @@ impl<S: Storage> Executor<S> {
             }
             Statement::Select {
                 columns,
-                table_name,
+                from,
                 filter,
                 ordering,
                 limit,
                 offset,
             } => {
                 let (columns, rows) =
-                    self.select(columns, table_name, filter, ordering, limit, offset)?;
+                    self.select(columns, from, filter, ordering, limit, offset)?;
 
                 Ok(ExecuteResult::Scan { columns, rows })
             }
@@ -121,7 +121,69 @@ impl<S: Storage> Executor<S> {
 
         let columns = table.columns.iter().map(|c| c.name.clone()).collect();
 
-        let rows = self.transaction.scan_table(table_name, filter)?;
+        let rows = self.transaction.scan_table(&table, filter)?;
+
+        Ok((columns, rows))
+    }
+
+    /// 扫描 Join 表，返回所有的列名和行数据
+    fn scan_all_from_join(&self, from: &SelectFrom) -> Result<(Vec<String>, Vec<Row>)> {
+        match from {
+            SelectFrom::Table { name } => self.scan(name, None),
+            SelectFrom::Join {
+                left,
+                right,
+                join_type,
+            } => {
+                let (mut left_columns, left_rows) = self.scan_all_from_join(left)?;
+                let (mut right_columns, right_rows) = self.scan_all_from_join(right)?;
+
+                // 合并左右表
+                match join_type {
+                    JoinType::Full => {
+                        // 对列名添加表名前缀，以便后续处理时能够识别
+                        if let SelectFrom::Table { ref name } = **left {
+                            left_columns.iter_mut().for_each(|col| {
+                                *col = format!("{}.{}", name, col);
+                            });
+                        }
+                        if let SelectFrom::Table { ref name } = **right {
+                            right_columns.iter_mut().for_each(|col| {
+                                *col = format!("{}.{}", name, col);
+                            });
+                        }
+                        let new_columns = [left_columns, right_columns].concat();
+                        let new_rows: Vec<Row> = left_rows
+                            .into_iter()
+                            .flat_map(|left_row| {
+                                right_rows.iter().map(move |right_row| {
+                                    let mut row = left_row.clone();
+                                    row.extend(right_row.clone());
+                                    row
+                                })
+                            })
+                            .collect();
+                        Ok((new_columns, new_rows))
+                    }
+                    _ => unimplemented!("Only support FULL JOIN"),
+                }
+            }
+        }
+    }
+
+    /// 从 Join 表中扫描数据并过滤
+    fn scan_from_join(
+        &self,
+        from: &SelectFrom,
+        filter: Option<(String, Expression)>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        let (columns, mut rows) = self.scan_all_from_join(from)?;
+
+        // 列名称在 `scan_all_from_join` 中改为 table_name.col_name，利用这个特性进行过滤
+        if let Some((col_name, expr)) = filter {
+            let col_idx = Self::get_column_index_by_name(&columns, &col_name)?;
+            rows.retain(|row| row[col_idx] == Value::from(expr.clone()));
+        }
 
         Ok((columns, rows))
     }
@@ -130,14 +192,14 @@ impl<S: Storage> Executor<S> {
     fn select(
         &self,
         select_columns: Vec<(String, Option<String>)>,
-        table_name: String,
+        from: SelectFrom,
         filter: Option<(String, Expression)>,
         ordering: Vec<(String, Ordering)>,
         limit: Option<Expression>,
         offset: Option<Expression>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
-        let (mut columns, mut rows) = self.scan(&table_name, filter)?;
-        self.sort_rows(&mut rows, &columns, ordering);
+        let (mut columns, mut rows) = self.scan_from_join(&from, filter)?;
+        self.sort_rows(&mut rows, &columns, ordering)?;
 
         // 处理 limit 和 offset
         if !(offset.is_none() && limit.is_none()) {
@@ -161,25 +223,23 @@ impl<S: Storage> Executor<S> {
 
         // 处理不是 SELECT * 的情况
         if !select_columns.is_empty() {
-            // 构建列名与索引的映射
-            let column_indices = columns
-                .iter()
-                .enumerate()
-                .map(|(i, col)| (col.clone(), i))
-                .collect::<HashMap<String, usize>>();
-
             // 一次性收集新列名和对应原索引
             let select_info = select_columns
                 .iter()
                 .map(|(col_name, alias)| {
-                    if let Some(&idx) = column_indices.get(col_name) {
-                        Ok((alias.clone().unwrap_or_else(|| col_name.clone()), idx))
-                    } else {
-                        Err(InternalError(format!(
-                            "Column {} not found in table {}",
-                            col_name, table_name
-                        )))
-                    }
+                    let idx = Self::get_column_index_by_name(&columns, col_name)?;
+                    Ok((
+                        alias.clone().unwrap_or_else(|| {
+                            if col_name.contains('.') {
+                                // 如果列名是 table_name.col_name 的形式，则只取 col_name
+                                col_name.split('.').last().unwrap().to_string()
+                            } else {
+                                // 否则直接使用
+                                col_name.clone()
+                            }
+                        }),
+                        idx,
+                    ))
                 })
                 .collect::<Result<Vec<(String, usize)>>>()?;
 
@@ -197,6 +257,11 @@ impl<S: Storage> Executor<S> {
                 })
                 .collect();
             columns = new_columns;
+        } else {
+            // 将列名从 table_name.col_name 改为 col_name
+            columns.iter_mut().for_each(|col| {
+                *col = col.split('.').last().unwrap().to_string();
+            });
         }
 
         Ok((columns, rows))
@@ -316,17 +381,59 @@ impl<S: Storage> Executor<S> {
         Ok(delete_count)
     }
 
+    /// 根据列名查找列索引
+    ///
+    /// columns 为 table_name.col_name 的形式，col_name 可能未 col_name 或 table_name.col_name
+    fn get_column_index_by_name(columns: &[String], col_name: &str) -> Result<usize> {
+        // col_name 如果是 table_name.col_name 的形式，则直接查找
+        if col_name.contains('.') {
+            Ok(columns
+                .iter()
+                .position(|col| col == col_name)
+                .ok_or(InternalError(format!(
+                    "Column {} not found in table",
+                    col_name
+                )))?)
+        } else {
+            // 如果是 col_name，则需要过滤所有符合要求的列名，并且如果存在多个则报错
+            let col_indices = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.split('.').last().unwrap() == col_name)
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            if col_indices.is_empty() {
+                return Err(InternalError(format!(
+                    "Column {} not found in table",
+                    col_name
+                )));
+            } else if col_indices.len() > 1 {
+                return Err(InternalError(format!(
+                    "Column {} is ambiguous in table",
+                    col_name
+                )));
+            }
+            Ok(col_indices[0])
+        }
+    }
+
     /// 对行进行排序
-    fn sort_rows(&self, rows: &mut [Row], columns: &[String], ordering: Vec<(String, Ordering)>) {
-        let col_indices = columns
-            .iter()
-            .enumerate()
-            .map(|(i, col)| (col.clone(), i))
-            .collect::<HashMap<String, usize>>();
+    fn sort_rows(
+        &self,
+        rows: &mut [Row],
+        columns: &[String],
+        ordering: Vec<(String, Ordering)>,
+    ) -> Result<()> {
+        // columns 改为了 table_name.col_name 的形式，这里需要处理
+        let ordering = ordering
+            .into_iter()
+            .map(|(col_name, ord)| {
+                Self::get_column_index_by_name(columns, &col_name).map(|col_idx| (col_idx, ord))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         rows.sort_by(|lhs, rhs| {
-            for (col_name, order) in ordering.iter() {
-                let col_idx = col_indices.get(col_name).unwrap();
+            for (col_idx, order) in ordering.iter() {
                 match lhs[*col_idx].partial_cmp(&rhs[*col_idx]) {
                     Some(ord) if ord != std::cmp::Ordering::Equal => {
                         return if *order == Ordering::Asc {
@@ -340,6 +447,8 @@ impl<S: Storage> Executor<S> {
             }
             std::cmp::Ordering::Equal
         });
+
+        Ok(())
     }
 }
 
@@ -424,7 +533,9 @@ mod tests {
                 ("id".to_string(), Some("user_id".to_string())),
                 ("name".to_string(), None),
             ],
-            table_name: "users".to_string(),
+            from: SelectFrom::Table {
+                name: "users".to_string(),
+            },
             filter: None,
             ordering: vec![("id".to_string(), Ordering::Desc)],
             limit: None,
@@ -466,7 +577,9 @@ mod tests {
                 .into_iter()
                 .map(|col| (col, None))
                 .collect(),
-            table_name: "users".to_string(),
+            from: SelectFrom::Table {
+                name: "users".to_string(),
+            },
             filter: None,
             ordering: vec![("name".to_string(), Ordering::Asc)],
             limit: Some(Expression::Constant(Constant::Integer(2))),
@@ -498,7 +611,9 @@ mod tests {
 
         let stmt = Statement::Select {
             columns: vec![],
-            table_name: "users".to_string(),
+            from: SelectFrom::Table {
+                name: "users".to_string(),
+            },
             filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(3)))),
             ordering: vec![],
             limit: None,
@@ -509,6 +624,78 @@ mod tests {
             assert_eq!(
                 rows,
                 vec![vec![Value::Integer(3), Value::String("Momo".to_string())],]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
+        let stmt = Statement::CreateTable {
+            name: "grades".to_string(),
+            columns: vec![
+                Column {
+                    name: "name".to_string(),
+                    data_type: DataType::String,
+                    nullable: false,
+                    default: None,
+                    primary_key: true,
+                },
+                Column {
+                    name: "grade".to_string(),
+                    data_type: DataType::Integer,
+                    nullable: true,
+                    default: Some(Value::Integer(0)),
+                    primary_key: false,
+                },
+            ],
+        };
+        executor.execute(stmt)?;
+
+        let stmt = Statement::Insert {
+            table_name: "grades".to_string(),
+            columns: None,
+            values: vec![
+                vec![
+                    Expression::Constant(Constant::String("Alice".to_string())),
+                    Expression::Constant(Constant::Integer(100)),
+                ],
+                vec![
+                    Expression::Constant(Constant::String("Bob".to_string())),
+                    Expression::Constant(Constant::Integer(90)),
+                ],
+            ],
+        };
+        executor.execute(stmt)?;
+
+        let stmt = Statement::Select {
+            columns: vec![
+                ("users.name".to_string(), None),
+                ("grade".to_string(), None),
+            ],
+            from: SelectFrom::Join {
+                left: Box::new(SelectFrom::Table {
+                    name: "users".to_string(),
+                }),
+                right: Box::new(SelectFrom::Table {
+                    name: "grades".to_string(),
+                }),
+                join_type: JoinType::Full,
+            },
+            filter: Some((
+                "users.id".to_string(),
+                Expression::Constant(Constant::Integer(1)),
+            )),
+            ordering: vec![("grade".to_string(), Ordering::Desc)],
+            limit: None,
+            offset: None,
+        };
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["name", "grade"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::String("Bob".to_string()), Value::Integer(100)],
+                    vec![Value::String("Bob".to_string()), Value::Integer(90)],
+                ]
             );
         } else {
             panic!("Expect ExecuteResult::Scan");
@@ -596,6 +783,51 @@ mod tests {
             assert_eq!(
                 rows,
                 vec![vec![Value::Integer(3), Value::String("Momo".to_string())],]
+            );
+        } else {
+            panic!("Expect ExecuteResult::Scan");
+        }
+
+        let sql = "CREATE TABLE grades (name TEXT PRIMARY KEY, grade INTEGER NULL DEFAULT 0);";
+        let stmt = parse_sql(sql)?;
+        executor.execute(stmt)?;
+
+        let sql = "INSERT INTO grades VALUES ('Alice', 100), ('Bob', 90);";
+        let stmt = parse_sql(sql)?;
+        executor.execute(stmt)?;
+
+        let sql = "SELECT * FROM users CROSS JOIN grades ORDER BY grade DESC;";
+        let stmt = parse_sql(sql)?;
+        if let ExecuteResult::Scan { columns, rows } = executor.execute(stmt)? {
+            assert_eq!(columns, vec!["id", "name", "name", "grade"]);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![
+                        Value::Integer(1),
+                        Value::String("Bob".to_string()),
+                        Value::String("Alice".to_string()),
+                        Value::Integer(100)
+                    ],
+                    vec![
+                        Value::Integer(3),
+                        Value::String("Momo".to_string()),
+                        Value::String("Alice".to_string()),
+                        Value::Integer(100)
+                    ],
+                    vec![
+                        Value::Integer(1),
+                        Value::String("Bob".to_string()),
+                        Value::String("Bob".to_string()),
+                        Value::Integer(90)
+                    ],
+                    vec![
+                        Value::Integer(3),
+                        Value::String("Momo".to_string()),
+                        Value::String("Bob".to_string()),
+                        Value::Integer(90)
+                    ],
+                ]
             );
         } else {
             panic!("Expect ExecuteResult::Scan");
