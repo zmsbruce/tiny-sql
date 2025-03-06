@@ -97,6 +97,17 @@ impl<S: Storage> Transaction<S> {
 
         // 将行数据序列化后存储，键为表名和主键值
         let key = Key::Row(table_name.to_string(), table.get_primary_key(row).clone());
+
+        // 如果主键已经存在，返回错误
+        if self.txn.get(&bincode::serialize(&key)?)?.is_some() {
+            return Err(InternalError(format!(
+                "Primary key {:?} in table {} already exists",
+                table.get_primary_key(row),
+                table_name
+            )));
+        }
+
+        // 存储行数据
         let value = bincode::serialize(row)?;
         self.txn.set(&bincode::serialize(&key)?, &value)?;
 

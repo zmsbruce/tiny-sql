@@ -82,6 +82,11 @@ pub enum Keyword {
     As,
     Cross,
     Join,
+    Left,
+    Right,
+    On,
+    Inner,
+    Full,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -126,6 +131,11 @@ impl TryFrom<&str> for Keyword {
             "AS" => Keyword::As,
             "CROSS" => Keyword::Cross,
             "JOIN" => Keyword::Join,
+            "LEFT" => Keyword::Left,
+            "RIGHT" => Keyword::Right,
+            "ON" => Keyword::On,
+            "INNER" => Keyword::Inner,
+            "FULL" => Keyword::Full,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -180,6 +190,11 @@ impl Display for Keyword {
             Keyword::As => "AS",
             Keyword::Cross => "CROSS",
             Keyword::Join => "JOIN",
+            Keyword::Left => "LEFT",
+            Keyword::Right => "RIGHT",
+            Keyword::On => "ON",
+            Keyword::Inner => "INNER",
+            Keyword::Full => "FULL",
         })
     }
 }
@@ -267,7 +282,7 @@ impl<'a> Lexer<'a> {
             .next_if(|c| c.is_alphabetic())
             .ok_or(ParseError("Expect an identifier".to_string()))?
             .to_string();
-        s.push_str(&self.next_while(|c| c.is_alphanumeric() || c == '_'));
+        s.push_str(&self.next_while(|c| c.is_alphanumeric() || c == '_' || c == '.'));
 
         Ok(Keyword::try_from(s.as_str())
             .map_or_else(|_| Token::Identifier(s.to_lowercase()), Token::Keyword))

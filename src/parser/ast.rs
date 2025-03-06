@@ -15,14 +15,49 @@ pub enum Constant {
 /// 表达式定义
 #[derive(PartialEq, Debug, Clone)]
 pub enum Expression {
+    Field(String),
     Constant(Constant),
+    Operation(Operation),
 }
 
-/// 将常量转换为表达式
-impl From<Constant> for Expression {
-    fn from(value: Constant) -> Self {
-        Expression::Constant(value)
+impl Expression {
+    pub fn is_field(&self) -> bool {
+        matches!(self, Expression::Field(_))
     }
+
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Expression::Constant(_))
+    }
+
+    pub fn is_operation(&self) -> bool {
+        matches!(self, Expression::Operation(_))
+    }
+
+    pub fn as_field(&self) -> Option<&String> {
+        match self {
+            Expression::Field(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn as_constant(&self) -> Option<&Constant> {
+        match self {
+            Expression::Constant(constant) => Some(constant),
+            _ => None,
+        }
+    }
+
+    pub fn as_operation(&self) -> Option<&Operation> {
+        match self {
+            Expression::Operation(operation) => Some(operation),
+            _ => None,
+        }
+    }
+}
+
+#[derive(PartialEq, Debug, Clone)]
+pub enum Operation {
+    Equal(Box<Expression>, Box<Expression>),
 }
 
 /// 排序方式
@@ -39,6 +74,19 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+    Cross,
+}
+
+impl Display for JoinType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinType::Inner => write!(f, "Inner Join"),
+            JoinType::Left => write!(f, "Left Join"),
+            JoinType::Right => write!(f, "Right Join"),
+            JoinType::Full => write!(f, "Full Join"),
+            JoinType::Cross => write!(f, "Cross Join"),
+        }
+    }
 }
 
 /// 查询来源
@@ -51,6 +99,7 @@ pub enum SelectFrom {
         left: Box<SelectFrom>,
         right: Box<SelectFrom>,
         join_type: JoinType,
+        predicate: Option<Expression>,
     },
 }
 
@@ -62,14 +111,9 @@ impl Display for SelectFrom {
                 left,
                 right,
                 join_type,
+                ..
             } => {
-                let join_symbol = match join_type {
-                    JoinType::Inner => "+",
-                    JoinType::Left => "<+",
-                    JoinType::Right => "+>",
-                    JoinType::Full => "<+>",
-                };
-                write!(f, "[{} {} {}]", left, join_symbol, right)
+                write!(f, "[{} {} {}]", left, join_type, right)
             }
         }
     }
@@ -88,7 +132,7 @@ pub enum Statement {
         values: Vec<Vec<Expression>>,
     },
     Select {
-        columns: Vec<(String, Option<String>)>,
+        columns: Vec<(Expression, Option<String>)>,
         from: SelectFrom,
         filter: Option<(String, Expression)>,
         ordering: Vec<(String, Ordering)>,

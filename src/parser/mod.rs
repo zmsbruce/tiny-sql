@@ -5,7 +5,7 @@ use crate::{
     Error::ParseError,
     Result,
 };
-use ast::{Constant, Expression, JoinType, Ordering, SelectFrom, Statement};
+use ast::{Constant, Expression, JoinType, Operation, Ordering, SelectFrom, Statement};
 use lexer::{Keyword, Lexer, Token};
 
 pub mod ast;
@@ -29,7 +29,7 @@ impl<'a> Parser<'a> {
     /// 支持的语句：
     ///
     /// ```sql
-    /// select [* | col_name [ [ AS ] output_name [, ...] ]] from [table_name] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
+    /// select [* | col_name [ [ AS ] output_name [, ...] ]] from [table_name [ cross | left | right | inner ] join ...] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
     ///
     /// create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     ///
@@ -161,37 +161,103 @@ impl<'a> Parser<'a> {
         };
 
         // 如果有 JOIN 子句，则解析 JOIN 子句
-        while self
-            .next_token_equal(Token::Keyword(Keyword::Cross))
-            .is_ok()
-        {
-            self.next_token_equal(Token::Keyword(Keyword::Join))?; // 期望下一个 token 是 JOIN
+        while let Ok(join_type) = self.parse_join() {
             let right = SelectFrom::Table {
                 name: self.next_identifier()?, // 获取右表名
             };
-            let join_type = JoinType::Full; // 默认为 FULL JOIN
+
+            // 解析 JOIN 条件
+            let predicate = match join_type {
+                JoinType::Cross => None,
+                _ => {
+                    self.next_token_equal(Token::Keyword(Keyword::On))?; // 期望下一个 token 是 ON
+                    let predicate = self.parse_expression()?;
+
+                    // JOIN 条件必须是一个字段等于另一个字段
+                    match predicate {
+                        Expression::Operation(Operation::Equal(ref left, ref right))
+                            if left.is_field() && right.is_field() => {}
+                        _ => {
+                            return Err(ParseError(
+                                "Join condition must be a field equal to a field".to_string(),
+                            ))
+                        }
+                    }
+                    Some(predicate) // 解析 JOIN 条件
+                }
+            };
             select_from = SelectFrom::Join {
                 left: Box::new(select_from),
                 right: Box::new(right),
                 join_type,
+                predicate,
             };
         }
 
         Ok(select_from)
     }
 
+    /// 解析 JOIN 类型，如果没有指定 JOIN 类型，则默认为 INNER JOIN
+    ///
+    /// 语法：`[CROSS | LEFT | RIGHT | INNER | FULL] JOIN`
+    fn parse_join(&mut self) -> Result<JoinType> {
+        match self.next_token_if(|token| {
+            matches!(
+                token,
+                Token::Keyword(Keyword::Cross)
+                    | Token::Keyword(Keyword::Left)
+                    | Token::Keyword(Keyword::Right)
+                    | Token::Keyword(Keyword::Inner)
+                    | Token::Keyword(Keyword::Join)
+                    | Token::Keyword(Keyword::Full)
+            )
+        })? {
+            Token::Keyword(Keyword::Cross) => {
+                self.next_token_equal(Token::Keyword(Keyword::Join))?;
+                Ok(JoinType::Cross)
+            }
+            Token::Keyword(Keyword::Left) => {
+                self.next_token_equal(Token::Keyword(Keyword::Join))?;
+                Ok(JoinType::Left)
+            }
+            Token::Keyword(Keyword::Right) => {
+                self.next_token_equal(Token::Keyword(Keyword::Join))?;
+                Ok(JoinType::Right)
+            }
+            Token::Keyword(Keyword::Inner) => {
+                self.next_token_equal(Token::Keyword(Keyword::Join))?;
+                Ok(JoinType::Inner)
+            }
+            Token::Keyword(Keyword::Full) => {
+                self.next_token_equal(Token::Keyword(Keyword::Join))?;
+                Ok(JoinType::Full)
+            }
+            // 如果没有指定 JOIN 类型，默认为 INNER JOIN
+            Token::Keyword(Keyword::Join) => Ok(JoinType::Inner),
+            // matches! 宏已经保证了 token 的类型，因此不可能出现其他类型的 token
+            _ => unreachable!(),
+        }
+    }
+
     /// 解析 SELECT 语句的列名
     /// 语法：`[* | col_name [ [AS] output_name [, ...] ]`
-    fn parse_select_columns(&mut self) -> Result<Vec<(String, Option<String>)>> {
+    fn parse_select_columns(&mut self) -> Result<Vec<(Expression, Option<String>)>> {
         let mut columns = Vec::new();
         if self.next_token_equal(Token::Asterisk).is_err() {
             loop {
-                let column_name = self.next_identifier()?; // 获取列名
+                let column_name = self.parse_expression()?; // 获取列名
+
+                // 列名必须是一个字段
+                if !matches!(column_name, Expression::Field(_)) {
+                    return Err(ParseError("Column name must be a field".to_string()));
+                }
+
+                // 获取列的别名
                 let alias = self
                     .next_token_if(|token| matches!(token, Token::Keyword(Keyword::As)))
                     .ok()
                     .map(|_| self.next_identifier())
-                    .transpose()?; // 获取列的别名
+                    .transpose()?;
                 columns.push((column_name, alias));
                 if self.next_token_equal(Token::Comma).is_err() {
                     break;
@@ -365,22 +431,33 @@ impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> Result<Expression> {
         // 获取下一个 token
         let exp = match self.next_token()? {
+            Token::Identifier(ident) => {
+                if self.next_token_equal(Token::Equal).is_ok() {
+                    let right = self.parse_expression()?;
+                    Expression::Operation(Operation::Equal(
+                        Box::new(Expression::Field(ident)),
+                        Box::new(right),
+                    ))
+                } else {
+                    Expression::Field(ident)
+                }
+            }
             Token::Number(num_str) => {
                 // 如果是数字，则解析为整数或浮点数
                 if num_str.chars().all(|ch| ch.is_ascii_digit()) {
                     // 如果数字全部是 0-9，则判断为整数
                     let num = num_str.parse::<i64>()?;
-                    Expression::from(Constant::Integer(num))
+                    Expression::Constant(Constant::Integer(num))
                 } else {
                     // 否则为浮点数
                     let num = num_str.parse::<f64>()?;
-                    Expression::from(Constant::Float(num))
+                    Expression::Constant(Constant::Float(num))
                 }
             }
-            Token::String(s) => Expression::from(Constant::String(s)), // 字符串
-            Token::Keyword(Keyword::True) => Expression::from(Constant::Boolean(true)), // 布尔值 true
-            Token::Keyword(Keyword::False) => Expression::from(Constant::Boolean(false)), // 布尔值 false
-            Token::Keyword(Keyword::Null) => Expression::from(Constant::Null),            // NULL
+            Token::String(s) => Expression::Constant(Constant::String(s)), // 字符串
+            Token::Keyword(Keyword::True) => Expression::Constant(Constant::Boolean(true)), // 布尔值 true
+            Token::Keyword(Keyword::False) => Expression::Constant(Constant::Boolean(false)), // 布尔值 false
+            Token::Keyword(Keyword::Null) => Expression::Constant(Constant::Null), // NULL
             token => return Err(ParseError(format!("Unexpected token {token}"))), // 其他 token，返回未知的 token 错误
         };
         Ok(exp)
@@ -541,7 +618,10 @@ mod tests {
         let columns = parser.parse_select_columns().unwrap();
         assert_eq!(
             columns,
-            vec![("name".to_string(), None), ("id".to_string(), None)]
+            vec![
+                (Expression::Field("name".to_string()), None),
+                (Expression::Field("id".to_string()), None)
+            ]
         );
 
         parser = Parser::new("name AS user_name, id AS user_id");
@@ -549,8 +629,14 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ("name".to_string(), Some("user_name".to_string())),
-                ("id".to_string(), Some("user_id".to_string()))
+                (
+                    Expression::Field("name".to_string()),
+                    Some("user_name".to_string())
+                ),
+                (
+                    Expression::Field("id".to_string()),
+                    Some("user_id".to_string())
+                )
             ]
         );
 
@@ -563,8 +649,11 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ("name".to_string(), Some("user_name".to_string())),
-                ("id".to_string(), None)
+                (
+                    Expression::Field("name".to_string()),
+                    Some("user_name".to_string())
+                ),
+                (Expression::Field("id".to_string()), None)
             ]
         );
     }
@@ -591,11 +680,13 @@ mod tests {
                 right: Box::new(SelectFrom::Table {
                     name: "table2".to_string()
                 }),
-                join_type: JoinType::Full,
+                join_type: JoinType::Cross,
+                predicate: None,
             }
         );
 
-        parser = Parser::new("FROM table1 CROSS JOIN table2 CROSS JOIN table3");
+        parser =
+            Parser::new("FROM table1 FULL JOIN table2 ON table1.name = table2.name INNER JOIN table3 ON table1.id = table2.id");
         let from = parser.parse_select_from().unwrap();
         assert_eq!(
             from,
@@ -608,11 +699,19 @@ mod tests {
                         name: "table2".to_string()
                     }),
                     join_type: JoinType::Full,
+                    predicate: Some(Expression::Operation(Operation::Equal(
+                        Box::new(Expression::Field("table1.name".to_string())),
+                        Box::new(Expression::Field("table2.name".to_string())),
+                    ))),
                 }),
                 right: Box::new(SelectFrom::Table {
                     name: "table3".to_string()
                 }),
-                join_type: JoinType::Full,
+                join_type: JoinType::Inner,
+                predicate: Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("table1.id".to_string())),
+                    Box::new(Expression::Field("table2.id".to_string())),
+                ))),
             }
         );
     }
@@ -620,15 +719,21 @@ mod tests {
     #[test]
     fn test_parse_select() {
         let mut parser = Parser::new(
-            "SELECT name AS user_name, id AS user_id FROM table1 CROSS JOIN table2 where id = 1 order by name desc, id limit 5 offset 1;",
+            "SELECT name AS user_name, id AS user_id FROM table1 LEFT JOIN table2 ON table1.name = table2.name where id = 1 order by name desc, id limit 5 offset 1;",
         );
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
             Statement::Select {
                 columns: vec![
-                    ("name".to_string(), Some("user_name".to_string())),
-                    ("id".to_string(), Some("user_id".to_string())),
+                    (
+                        Expression::Field("name".to_string()),
+                        Some("user_name".to_string())
+                    ),
+                    (
+                        Expression::Field("id".to_string()),
+                        Some("user_id".to_string())
+                    ),
                 ],
                 from: SelectFrom::Join {
                     left: Box::new(SelectFrom::Table {
@@ -637,15 +742,19 @@ mod tests {
                     right: Box::new(SelectFrom::Table {
                         name: "table2".to_string()
                     }),
-                    join_type: JoinType::Full,
+                    join_type: JoinType::Left,
+                    predicate: Some(Expression::Operation(Operation::Equal(
+                        Box::new(Expression::Field("table1.name".to_string())),
+                        Box::new(Expression::Field("table2.name".to_string())),
+                    ))),
                 },
-                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
                 ordering: vec![
                     ("name".to_string(), Ordering::Desc),
                     ("id".to_string(), Ordering::Asc)
                 ],
-                limit: Some(Expression::from(Constant::Integer(5))),
-                offset: Some(Expression::from(Constant::Integer(1))),
+                limit: Some(Expression::Constant(Constant::Integer(5))),
+                offset: Some(Expression::Constant(Constant::Integer(1))),
             }
         );
 
@@ -679,7 +788,7 @@ mod tests {
                 name: "name".to_string(),
                 data_type: DataType::String,
                 nullable: false,
-                default: Some(Expression::from(Constant::String("hello".to_string())).into()),
+                default: Some(Expression::Constant(Constant::String("hello".to_string())).into()),
                 primary_key: true,
             }
         );
@@ -689,23 +798,26 @@ mod tests {
     fn test_parse_constant_expression() {
         let mut parser = Parser::new("123");
         let exp = parser.parse_expression().unwrap();
-        assert_eq!(exp, Expression::from(Constant::Integer(123)));
+        assert_eq!(exp, Expression::Constant(Constant::Integer(123)));
 
         parser = Parser::new("123.456");
         let exp = parser.parse_expression().unwrap();
-        assert_eq!(exp, Expression::from(Constant::Float(123.456)));
+        assert_eq!(exp, Expression::Constant(Constant::Float(123.456)));
 
         parser = Parser::new("'hello'");
         let exp = parser.parse_expression().unwrap();
-        assert_eq!(exp, Expression::from(Constant::String("hello".to_string())));
+        assert_eq!(
+            exp,
+            Expression::Constant(Constant::String("hello".to_string()))
+        );
 
         parser = Parser::new("true");
         let exp = parser.parse_expression().unwrap();
-        assert_eq!(exp, Expression::from(Constant::Boolean(true)));
+        assert_eq!(exp, Expression::Constant(Constant::Boolean(true)));
 
         parser = Parser::new("NULL");
         let exp = parser.parse_expression().unwrap();
-        assert_eq!(exp, Expression::from(Constant::Null));
+        assert_eq!(exp, Expression::Constant(Constant::Null));
     }
 
     #[test]
@@ -720,7 +832,9 @@ mod tests {
                     name: "name".to_string(),
                     data_type: DataType::String,
                     nullable: true,
-                    default: Some(Expression::from(Constant::String("hello".to_string())).into()),
+                    default: Some(
+                        Expression::Constant(Constant::String("hello".to_string())).into()
+                    ),
                     primary_key: false,
                 }],
             }
@@ -762,8 +876,8 @@ mod tests {
                 table_name: "table1".to_string(),
                 columns: None,
                 values: vec![vec![
-                    Expression::from(Constant::Integer(1)),
-                    Expression::from(Constant::String("hello".to_string())),
+                    Expression::Constant(Constant::Integer(1)),
+                    Expression::Constant(Constant::String("hello".to_string())),
                 ]],
             }
         );
@@ -776,8 +890,8 @@ mod tests {
                 table_name: "table1".to_string(),
                 columns: Some(vec!["id".to_string(), "name".to_string()]),
                 values: vec![vec![
-                    Expression::from(Constant::Integer(1)),
-                    Expression::from(Constant::String("hello".to_string())),
+                    Expression::Constant(Constant::Integer(1)),
+                    Expression::Constant(Constant::String("hello".to_string())),
                 ]],
             }
         );
@@ -793,11 +907,11 @@ mod tests {
                 table_name: "table1".to_string(),
                 columns: vec![(
                     "name".to_string(),
-                    Expression::from(Constant::String("hello".to_string()))
+                    Expression::Constant(Constant::String("hello".to_string()))
                 )]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
             }
         );
 
@@ -810,13 +924,16 @@ mod tests {
                 columns: vec![
                     (
                         "name".to_string(),
-                        Expression::from(Constant::String("hello".to_string()))
+                        Expression::Constant(Constant::String("hello".to_string()))
                     ),
-                    ("age".to_string(), Expression::from(Constant::Integer(18))),
+                    (
+                        "age".to_string(),
+                        Expression::Constant(Constant::Integer(18))
+                    ),
                 ]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
             }
         );
 
@@ -828,11 +945,11 @@ mod tests {
                 table_name: "table1".to_string(),
                 columns: vec![(
                     "name".to_string(),
-                    Expression::from(Constant::String("hello".to_string()))
+                    Expression::Constant(Constant::String("hello".to_string()))
                 )]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1)))),
+                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
             }
         );
 
@@ -844,7 +961,7 @@ mod tests {
                 table_name: "table1".to_string(),
                 columns: vec![(
                     "name".to_string(),
-                    Expression::from(Constant::String("hello".to_string()))
+                    Expression::Constant(Constant::String("hello".to_string()))
                 )]
                 .into_iter()
                 .collect(),
@@ -861,7 +978,7 @@ mod tests {
             statement,
             Statement::Delete {
                 table_name: "table1".to_string(),
-                filter: Some(("id".to_string(), Expression::from(Constant::Integer(1))),),
+                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1))),),
             }
         );
 
