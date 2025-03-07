@@ -37,6 +37,32 @@ pub enum Value {
     String(String),
 }
 
+impl Value {
+    pub fn as_f64(&self) -> Result<f64> {
+        match self {
+            Self::Float(f) => Ok(*f),
+            other => Err(InternalError(format!("Cannot convert {:?} to f64", other))),
+        }
+    }
+
+    pub fn as_i64(&self) -> Result<i64> {
+        match self {
+            Self::Integer(i) => Ok(*i),
+            other => Err(InternalError(format!("Cannot convert {:?} to i64", other))),
+        }
+    }
+
+    pub fn as_str(&self) -> Result<&str> {
+        match self {
+            Self::String(s) => Ok(s),
+            other => Err(InternalError(format!(
+                "Cannot convert {:?} to string",
+                other
+            ))),
+        }
+    }
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {

@@ -5,7 +5,7 @@ use crate::{
     Error::ParseError,
     Result,
 };
-use ast::{Constant, Expression, JoinType, Operation, Ordering, SelectFrom, Statement};
+use ast::{Aggregate, Constant, Expression, JoinType, Operation, Ordering, SelectFrom, Statement};
 use lexer::{Keyword, Lexer, Token};
 
 pub mod ast;
@@ -247,8 +247,8 @@ impl<'a> Parser<'a> {
             loop {
                 let column_name = self.parse_expression()?; // 获取列名
 
-                // 列名必须是一个字段
-                if !matches!(column_name, Expression::Field(_)) {
+                // 列名必须是一个字段或者函数名
+                if !(column_name.is_field() || column_name.is_function()) {
                     return Err(ParseError("Column name must be a field".to_string()));
                 }
 
@@ -438,6 +438,14 @@ impl<'a> Parser<'a> {
                         Box::new(Expression::Field(ident)),
                         Box::new(right),
                     ))
+                } else if self.next_token_equal(Token::OpenParen).is_ok() {
+                    let col_name = if self.next_token_equal(Token::Asterisk).is_ok() {
+                        "*".to_string()
+                    } else {
+                        self.next_identifier()?
+                    };
+                    self.next_token_equal(Token::CloseParen)?;
+                    Expression::Function(Aggregate::try_from(ident)?, col_name)
                 } else {
                     Expression::Field(ident)
                 }
@@ -991,5 +999,106 @@ mod tests {
                 filter: None,
             }
         );
+    }
+
+    #[test]
+    fn test_parse_aggregate_select() {
+        let mut parser = Parser::new("SELECT COUNT(*) FROM table1;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                columns: vec![(
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    None
+                )],
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
+                filter: None,
+                ordering: vec![],
+                limit: None,
+                offset: None,
+            }
+        );
+
+        parser = Parser::new("SELECT AVG(age) FROM table1;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                columns: vec![(
+                    Expression::Function(Aggregate::Avg, "age".to_string()),
+                    None
+                )],
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
+                filter: None,
+                ordering: vec![],
+                limit: None,
+                offset: None,
+            }
+        );
+
+        parser = Parser::new("SELECT SUM(salary) FROM table1;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                columns: vec![(
+                    Expression::Function(Aggregate::Sum, "salary".to_string()),
+                    None
+                )],
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
+                filter: None,
+                ordering: vec![],
+                limit: None,
+                offset: None,
+            }
+        );
+
+        parser = Parser::new("SELECT MIN(age) FROM table1;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                columns: vec![(
+                    Expression::Function(Aggregate::Min, "age".to_string()),
+                    None
+                )],
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
+                filter: None,
+                ordering: vec![],
+                limit: None,
+                offset: None,
+            }
+        );
+
+        parser = Parser::new("SELECT MAX(age) FROM table1;");
+        let statement = parser.parse_select().unwrap();
+        assert_eq!(
+            statement,
+            Statement::Select {
+                columns: vec![(
+                    Expression::Function(Aggregate::Max, "age".to_string()),
+                    None
+                )],
+                from: SelectFrom::Table {
+                    name: "table1".to_string()
+                },
+                filter: None,
+                ordering: vec![],
+                limit: None,
+                offset: None,
+            }
+        );
+
+        parser = Parser::new("SELECT INVALID_AGG(*) AS total FROM table1;");
+        assert!(parser.parse_select().is_err());
     }
 }

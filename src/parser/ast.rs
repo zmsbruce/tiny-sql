@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display};
 
-use crate::schema::Column;
+use crate::{error::Error::ParseError, schema::Column};
 
 /// 常量定义
 #[derive(PartialEq, Debug, Clone)]
@@ -18,6 +18,7 @@ pub enum Expression {
     Field(String),
     Constant(Constant),
     Operation(Operation),
+    Function(Aggregate, String),
 }
 
 impl Expression {
@@ -31,6 +32,10 @@ impl Expression {
 
     pub fn is_operation(&self) -> bool {
         matches!(self, Expression::Operation(_))
+    }
+
+    pub fn is_function(&self) -> bool {
+        matches!(self, Expression::Function(_, _))
     }
 
     pub fn as_field(&self) -> Option<&String> {
@@ -51,6 +56,49 @@ impl Expression {
         match self {
             Expression::Operation(operation) => Some(operation),
             _ => None,
+        }
+    }
+
+    pub fn as_function(&self) -> Option<(Aggregate, &String)> {
+        match self {
+            Expression::Function(aggregate, alias) => Some((*aggregate, alias)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Aggregate {
+    Count,
+    Sum,
+    Avg,
+    Max,
+    Min,
+}
+
+impl Display for Aggregate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Aggregate::Count => write!(f, "COUNT"),
+            Aggregate::Sum => write!(f, "SUM"),
+            Aggregate::Avg => write!(f, "AVG"),
+            Aggregate::Max => write!(f, "MAX"),
+            Aggregate::Min => write!(f, "MIN"),
+        }
+    }
+}
+
+impl TryFrom<String> for Aggregate {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "count" => Ok(Aggregate::Count),
+            "sum" => Ok(Aggregate::Sum),
+            "avg" => Ok(Aggregate::Avg),
+            "max" => Ok(Aggregate::Max),
+            "min" => Ok(Aggregate::Min),
+            _ => Err(ParseError(format!("Invalid aggregate function: {}", value))),
         }
     }
 }

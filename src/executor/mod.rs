@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 
+use aggregate::aggregate;
+use join::{hash_join, loop_join};
+
 use crate::{
     engine::{Engine, Transaction},
     error::{Error::InternalError, Result},
-    parser::ast::{Expression, JoinType, Operation, Ordering, SelectFrom, Statement},
+    parser::ast::{Expression, JoinType, Ordering, SelectFrom, Statement},
     schema::{Row, Table, Value},
     storage::Storage,
 };
+
+mod aggregate;
+mod join;
 
 /// SQL 执行结果
 #[derive(Debug, PartialEq)]
@@ -278,21 +284,10 @@ impl<S: Storage> Executor<S> {
                 // 合并左右表
                 match join_type {
                     JoinType::Cross => {
-                        let new_columns = [left_columns, right_columns].concat();
-                        let new_rows: Vec<Row> = left_rows
-                            .into_iter()
-                            .flat_map(|left_row| {
-                                right_rows.iter().map(move |right_row| {
-                                    let mut row = left_row.clone();
-                                    row.extend(right_row.clone());
-                                    row
-                                })
-                            })
-                            .collect();
-                        Ok((new_columns, new_rows))
+                        loop_join(&left_columns, &right_columns, &left_rows, &right_rows)
                     }
                     JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
-                        Self::hash_join(
+                        hash_join(
                             &left_columns,
                             &right_columns,
                             &left_rows,
@@ -304,155 +299,6 @@ impl<S: Storage> Executor<S> {
                 }
             }
         }
-    }
-
-    fn hash_join(
-        left_cols: &[String],
-        right_cols: &[String],
-        left_rows: &[Row],
-        right_rows: &[Row],
-        join_type: &JoinType,
-        predicate: &Expression,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
-        // 解析 Join 条件
-        let (left_cond, right_cond) = match predicate {
-            Expression::Operation(Operation::Equal(left, right))
-                if left.is_field() && right.is_field() =>
-            {
-                (left.as_field().unwrap(), right.as_field().unwrap())
-            }
-            _ => return Err(InternalError("Unsupported join condition".to_string())),
-        };
-
-        // 获取左右表的列索引
-        let left_col_idx = left_cols
-            .iter()
-            .position(|col| col == left_cond)
-            .ok_or(InternalError(format!("Column {} not found", left_cond)))?;
-        let right_col_idx = right_cols
-            .iter()
-            .position(|col| col == right_cond)
-            .ok_or(InternalError(format!("Column {} not found", right_cond)))?;
-
-        // 合并左右表的列名
-        let new_columns = [left_cols, right_cols].concat();
-
-        // 根据 join_type 不同，分别构建匹配结果
-        let new_rows = match join_type {
-            // INNER 和 LEFT JOIN：构建右表哈希表，根据左表中对应值查找匹配行
-            JoinType::Inner | JoinType::Left => {
-                // 构建右表的哈希表
-                let mut right_hash = HashMap::new();
-                for row in right_rows {
-                    let rows = right_hash
-                        .entry(row[right_col_idx].clone())
-                        .or_insert(Vec::new());
-                    rows.push(row);
-                }
-
-                let mut new_rows = Vec::new();
-                for left_row in left_rows {
-                    if let Some(right_rows) = right_hash.get(&left_row[left_col_idx]) {
-                        for right_row in right_rows {
-                            let mut new_row = left_row.clone();
-                            new_row.extend(right_row.iter().cloned());
-                            new_rows.push(new_row);
-                        }
-                    } else if matches!(join_type, JoinType::Left) {
-                        // 如果是 LEFT JOIN，则将右表的列填充为 NULL，否则忽略
-                        let mut new_row = left_row.clone();
-                        new_row.extend(vec![Value::Null; right_cols.len()]);
-                        new_rows.push(new_row);
-                    }
-                }
-                new_rows
-            }
-            // RIGHT JOIN：构建左表哈希表，根据右表中对应值查找匹配行
-            JoinType::Right => {
-                // 构建左表的哈希表
-                let mut left_hash = HashMap::new();
-                for row in left_rows {
-                    let rows = left_hash
-                        .entry(row[left_col_idx].clone())
-                        .or_insert(Vec::new());
-                    rows.push(row);
-                }
-
-                // 通过右表的列值在左表的哈希表中查找匹配的行，并将左右表的行合并
-                let mut new_rows = Vec::new();
-                for right_row in right_rows {
-                    if let Some(left_rows) = left_hash.get(&right_row[right_col_idx]) {
-                        for left_row in left_rows {
-                            let mut new_row = left_row.to_vec();
-                            new_row.extend(right_row.clone());
-                            new_rows.push(new_row);
-                        }
-                    } else {
-                        // 将左表的列填充为 NULL
-                        let mut new_row = vec![Value::Null; left_cols.len()];
-                        new_row.extend(right_row.iter().cloned());
-                        new_rows.push(new_row);
-                    }
-                }
-                new_rows
-            }
-            // FULL JOIN：同时处理左右未匹配的情况
-            JoinType::Full => {
-                // 构建左表的哈希表
-                let mut left_hash = HashMap::new();
-                for row in left_rows {
-                    let rows = left_hash
-                        .entry(row[left_col_idx].clone())
-                        .or_insert(Vec::new());
-                    rows.push(row);
-                }
-
-                // 构建右表的哈希表
-                let mut right_hash = HashMap::new();
-                for row in right_rows {
-                    let rows = right_hash
-                        .entry(row[right_col_idx].clone())
-                        .or_insert(Vec::new());
-                    rows.push(row);
-                }
-
-                // 通过左表的列值在右表的哈希表中查找匹配的行，并将左右表的行合并
-                let mut new_rows = Vec::new();
-                for left_row in left_rows {
-                    if let Some(right_rows) = right_hash.get(&left_row[left_col_idx]) {
-                        for right_row in right_rows {
-                            let mut new_row = left_row.clone();
-                            new_row.extend(right_row.iter().cloned());
-                            new_rows.push(new_row);
-                        }
-                    } else {
-                        // 将右表的列填充为 NULL
-                        let mut new_row = left_row.clone();
-                        new_row.extend(vec![Value::Null; right_cols.len()]);
-                        new_rows.push(new_row);
-                    }
-                }
-
-                // 查找右表中未匹配的行
-                for right_row in right_rows {
-                    if !left_hash.contains_key(&right_row[right_col_idx]) {
-                        // 将左表的列填充为 NULL
-                        let mut new_row = vec![Value::Null; left_cols.len()];
-                        new_row.extend(right_row.iter().cloned());
-                        new_rows.push(new_row);
-                    }
-                }
-                new_rows
-            }
-            _ => {
-                return Err(InternalError(format!(
-                    "Unsupported join type: {}",
-                    join_type
-                )))
-            }
-        };
-
-        Ok((new_columns, new_rows))
     }
 
     /// 从 Join 表中扫描数据并过滤
@@ -472,6 +318,14 @@ impl<S: Storage> Executor<S> {
         Ok((columns, rows))
     }
 
+    /// 从 `table_name.column_name` 中提取 `column_name`
+    fn extract_column_name(full_column_name: &str) -> &str {
+        full_column_name
+            .split('.')
+            .last()
+            .unwrap_or(full_column_name)
+    }
+
     /// 查询数据
     fn select(
         &self,
@@ -482,7 +336,7 @@ impl<S: Storage> Executor<S> {
         limit: Option<Expression>,
         offset: Option<Expression>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
-        let (mut columns, mut rows) = self.scan_from_join(&from, filter)?;
+        let (columns, mut rows) = self.scan_from_join(&from, filter)?;
         self.sort_rows(&mut rows, &columns, ordering)?;
 
         // 处理 limit 和 offset
@@ -507,55 +361,103 @@ impl<S: Storage> Executor<S> {
 
         // 处理不是 SELECT * 的情况
         if !select_columns.is_empty() {
-            // 一次性收集新列名和对应原索引
-            let select_info = select_columns
-                .iter()
-                .map(|(col_name, alias)| {
-                    if let Expression::Field(col_name) = col_name {
-                        let idx = Self::get_column_index_by_name(&columns, col_name)?;
-                        Ok((
-                            alias.clone().unwrap_or_else(|| {
-                                if col_name.contains('.') {
-                                    // 如果列名是 table_name.col_name 的形式，则只取 col_name
-                                    col_name.split('.').last().unwrap().to_string()
-                                } else {
-                                    // 否则直接使用
-                                    col_name.clone()
-                                }
-                            }),
-                            idx,
-                        ))
-                    } else {
-                        Err(InternalError(format!(
-                            "Unsupported expression in SELECT: {:?}",
-                            col_name
-                        )))
-                    }
-                })
-                .collect::<Result<Vec<(String, usize)>>>()?;
+            // column 可以全部是聚集函数，或者全部是列名，不允许出现混合的情况
+            if select_columns.iter().all(|(col, _)| col.is_function()) {
+                // 全部是聚集函数
+                let (new_columns, new_rows) =
+                    Self::select_aggregate_columns(&select_columns, &columns, &rows)?;
 
-            // 更新列名
-            let new_columns = select_info.iter().map(|(alias, _)| alias.clone()).collect();
+                Ok((new_columns, new_rows))
+            } else if select_columns.iter().all(|(col, _)| col.is_field()) {
+                // 全是列名
+                let (new_columns, new_rows) =
+                    self.select_field_columns(&select_columns, &columns, rows)?;
 
-            // 根据新选择的列，调整每一行
-            rows = rows
-                .into_iter()
-                .map(|row| {
-                    select_info
-                        .iter()
-                        .map(|&(_, idx)| row[idx].clone())
-                        .collect::<Vec<Value>>()
-                })
-                .collect();
-            columns = new_columns;
+                Ok((new_columns, new_rows))
+            } else {
+                // 既有聚集函数又有列名，报错
+                Err(InternalError(
+                    "All columns must be either aggregate functions or column names".to_string(),
+                ))
+            }
         } else {
             // 将列名从 table_name.col_name 改为 col_name
-            columns.iter_mut().for_each(|col| {
-                *col = col.split('.').last().unwrap().to_string();
-            });
-        }
+            let columns = columns
+                .into_iter()
+                .map(|full_name| Self::extract_column_name(&full_name).to_string())
+                .collect();
 
-        Ok((columns, rows))
+            Ok((columns, rows))
+        }
+    }
+
+    /// 选择列名
+    fn select_field_columns(
+        &self,
+        select_columns: &[(Expression, Option<String>)],
+        columns: &[String],
+        rows: Vec<Row>,
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // 一次性收集新列名
+        let new_columns = select_columns
+            .iter()
+            .map(|(col_expr, alias)| match col_expr {
+                Expression::Field(col_name) => alias
+                    .clone()
+                    .unwrap_or_else(|| Self::extract_column_name(col_name).to_string()),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+
+        // 收集需要选择的列索引
+        let col_indices = select_columns
+            .iter()
+            .map(|(col_expr, _)| match col_expr {
+                Expression::Field(col_name) => Self::get_column_index_by_name(columns, col_name),
+                _ => unreachable!(),
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // 选择需要的列
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                col_indices
+                    .iter()
+                    .map(|col_idx| row[*col_idx].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Ok((new_columns, rows))
+    }
+
+    /// 选择聚集函数的列
+    fn select_aggregate_columns(
+        select_columns: &[(Expression, Option<String>)],
+        columns: &[String],
+        rows: &[Row],
+    ) -> Result<(Vec<String>, Vec<Row>)> {
+        // 一次性收集新列名
+        let new_columns = select_columns
+            .iter()
+            .map(|(col, alias)| match col {
+                Expression::Function(agg, col_name) => Ok(alias
+                    .clone()
+                    .unwrap_or_else(|| format!("{}({})", agg, col_name))),
+                _ => unreachable!(),
+            })
+            .collect::<Result<Vec<String>>>()?;
+
+        // 计算聚集函数的值
+        let agg_values = select_columns
+            .iter()
+            .map(|(col, _)| match col {
+                Expression::Function(agg, col_name) => aggregate(col_name, columns, rows, *agg),
+                _ => unreachable!(),
+            })
+            .collect::<Result<Vec<Value>>>()?;
+
+        Ok((new_columns, vec![agg_values]))
     }
 
     /// 根据列名查找列索引
@@ -639,7 +541,7 @@ mod tests {
     use super::*;
     use crate::{
         error::Result,
-        parser::ast::Constant,
+        parser::ast::{Aggregate, Constant, Operation},
         schema::{Column, DataType},
         storage::MemoryStorage,
     };
@@ -1343,6 +1245,157 @@ mod tests {
                 ],
             ]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate() -> Result<()> {
+        let executor = init_executor()?;
+        create_tables(&executor)?;
+        insert_data(&executor)?;
+
+        // 测试 COUNT(*)
+        let (columns, rows) = executor.select(
+            vec![(
+                Expression::Function(Aggregate::Count, "*".to_string()),
+                None,
+            )],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["COUNT(*)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+
+        // 测试 COUNT(name)
+        let (columns, rows) = executor.select(
+            vec![(
+                Expression::Function(Aggregate::Count, "name".to_string()),
+                None,
+            )],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["COUNT(name)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+        // 测试 COUNT(DISTINCT name)
+        let (columns, rows) = executor.select(
+            vec![(
+                Expression::Function(Aggregate::Count, "name".to_string()),
+                Some("count".to_string()),
+            )],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["count"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+        // 测试 SUM(id)
+        let (columns, rows) = executor.select(
+            vec![(Expression::Function(Aggregate::Sum, "id".to_string()), None)],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["SUM(id)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(3)]]);
+
+        // 测试 AVG(id)
+        let (columns, rows) = executor.select(
+            vec![(Expression::Function(Aggregate::Avg, "id".to_string()), None)],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["AVG(id)"]);
+        assert_eq!(rows, vec![vec![Value::Float(1.5)]]);
+
+        // 测试 MAX(id)
+        let (columns, rows) = executor.select(
+            vec![(Expression::Function(Aggregate::Max, "id".to_string()), None)],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["MAX(id)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(2)]]);
+
+        // 测试 MIN(id)
+        let (columns, rows) = executor.select(
+            vec![(Expression::Function(Aggregate::Min, "id".to_string()), None)],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["MIN(id)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+        // 测试 MIN(id), MAX(id)
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Function(Aggregate::Min, "id".to_string()), None),
+                (Expression::Function(Aggregate::Max, "id".to_string()), None),
+            ],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["MIN(id)", "MAX(id)"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1), Value::Integer(2)]]);
+
+        // 测试 MIN(id) alias min_id
+        // 测试 MIN(id)
+        let (columns, rows) = executor.select(
+            vec![(
+                Expression::Function(Aggregate::Min, "id".to_string()),
+                Some("min_id".to_string()),
+            )],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["min_id"]);
+        assert_eq!(rows, vec![vec![Value::Integer(1)]]);
 
         Ok(())
     }
