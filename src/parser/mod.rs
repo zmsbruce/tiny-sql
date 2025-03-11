@@ -29,7 +29,13 @@ impl<'a> Parser<'a> {
     /// 支持的语句：
     ///
     /// ```sql
-    /// select [* | col_name [ [ AS ] output_name [, ...] ]] from [table_name [ cross | left | right | inner ] join ...] [where [condition]] [order by [column_name] [asc|desc]] [limit [number]] [offset [number]];
+    /// select [* | col_name [ [ AS ] output_name [, ...] ]]
+    /// from [table_name [ cross | left | right | inner ] join ...]
+    /// [where [condition]]
+    /// [group by [ [column_name], ...] [having [condition]]]
+    /// [order by [column_name] [asc|desc]]
+    /// [limit [number]]
+    /// [offset [number]];
     ///
     /// create table [table_name] ([column_name] [data_type] [nullable] [default] [primary key], ...);
     ///
@@ -111,7 +117,6 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 SELECT 语句
-    /// 语法：`SELECT [* | col_name [ [AS] output_name [, ...] ]] FROM [table_name] WHERE [condition] ORDER BY [column_name] [ASC|DESC] LIMIT [number] OFFSET [number];`
     fn parse_select(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Select))?; // 期望下一个 token 是 SELECT
 
@@ -126,6 +131,9 @@ impl<'a> Parser<'a> {
             .ok()
             .map(|_| self.parse_where_clause())
             .transpose()?;
+
+        // 如果有 GROUP BY 子句，则解析 GROUP BY 子句
+        let groupby = self.parse_group_by()?;
 
         // 如果有 ORDER BY 子句，则解析 ORDER BY 子句
         let ordering = self.parse_order_by()?.unwrap_or_default();
@@ -145,6 +153,7 @@ impl<'a> Parser<'a> {
             columns,
             from,
             filter,
+            groupby,
             ordering,
             limit,
             offset,
@@ -267,6 +276,31 @@ impl<'a> Parser<'a> {
         Ok(columns)
     }
 
+    /// 解析 GROUP BY 子句，可能不存在
+    /// 语法：`GROUP BY column_name`
+    fn parse_group_by(&mut self) -> Result<Option<(Vec<Expression>, Option<Expression>)>> {
+        self.next_token_equal(Token::Keyword(Keyword::Group))
+            .ok()
+            .map(|_| {
+                self.next_token_equal(Token::Keyword(Keyword::By))?; // 期望下一个 token 是 BY
+                let mut group = Vec::new();
+                loop {
+                    group.push(self.parse_expression()?); // 获取列名
+                    if self.next_token_equal(Token::Comma).is_err() {
+                        break;
+                    }
+                }
+                // 如果有 HAVING 子句，则解析 HAVING 子句
+                let having = self
+                    .next_token_equal(Token::Keyword(Keyword::Having))
+                    .ok()
+                    .map(|_| self.parse_expression())
+                    .transpose()?;
+                Ok::<_, crate::Error>((group, having))
+            })
+            .transpose()
+    }
+
     /// 解析 ORDER BY 子句，可能不存在
     /// 语法：`ORDER BY [column_name] [ASC|DESC], ...`
     fn parse_order_by(&mut self) -> Result<Option<Vec<(String, Ordering)>>> {
@@ -299,7 +333,6 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 UPDATE 语句
-    /// 语法：`UPDATE [table_name] SET [column_name] = [value], ... WHERE [condition];`
     fn parse_update(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Update))?;
 
@@ -356,8 +389,6 @@ impl<'a> Parser<'a> {
     }
 
     /// 解析 DELETE 语句
-    ///
-    /// 语法：`DELETE FROM [table_name] WHERE [condition];`
     fn parse_delete(&mut self) -> Result<Statement> {
         self.next_token_equal(Token::Keyword(Keyword::Delete))?;
         self.next_token_equal(Token::Keyword(Keyword::From))?;
@@ -445,7 +476,17 @@ impl<'a> Parser<'a> {
                         self.next_identifier()?
                     };
                     self.next_token_equal(Token::CloseParen)?;
-                    Expression::Function(Aggregate::try_from(ident)?, col_name)
+
+                    let func = Expression::Function(Aggregate::try_from(ident)?, col_name);
+                    // 如果下一个是等号，则解析为等于操作
+                    if self.next_token_equal(Token::Equal).is_ok() {
+                        // Func(col_name) = right
+                        let right = self.parse_expression()?;
+                        Expression::Operation(Operation::Equal(Box::new(func), Box::new(right)))
+                    } else {
+                        // Func(col_name)
+                        func
+                    }
                 } else {
                     Expression::Field(ident)
                 }
@@ -757,6 +798,7 @@ mod tests {
                     ))),
                 },
                 filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+                groupby: None,
                 ordering: vec![
                     ("name".to_string(), Ordering::Desc),
                     ("id".to_string(), Ordering::Asc)
@@ -776,6 +818,7 @@ mod tests {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: None,
                 ordering: vec![],
                 limit: None,
                 offset: None,
@@ -1016,6 +1059,7 @@ mod tests {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: None,
                 ordering: vec![],
                 limit: None,
                 offset: None,
@@ -1035,25 +1079,42 @@ mod tests {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: None,
                 ordering: vec![],
                 limit: None,
                 offset: None,
             }
         );
 
-        parser = Parser::new("SELECT SUM(salary) FROM table1;");
+        parser = Parser::new(
+            "SELECT group_id as gid, class_id, SUM(salary) FROM table1 GROUP BY group_id, class_id;",
+        );
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
             Statement::Select {
-                columns: vec![(
-                    Expression::Function(Aggregate::Sum, "salary".to_string()),
-                    None
-                )],
+                columns: vec![
+                    (
+                        Expression::Field("group_id".to_string()),
+                        Some("gid".to_string())
+                    ),
+                    (Expression::Field("class_id".to_string()), None),
+                    (
+                        Expression::Function(Aggregate::Sum, "salary".to_string()),
+                        None,
+                    )
+                ],
                 from: SelectFrom::Table {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: Some((
+                    vec![
+                        Expression::Field("group_id".to_string()),
+                        Expression::Field("class_id".to_string())
+                    ],
+                    None
+                )),
                 ordering: vec![],
                 limit: None,
                 offset: None,
@@ -1073,13 +1134,14 @@ mod tests {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: None,
                 ordering: vec![],
                 limit: None,
                 offset: None,
             }
         );
 
-        parser = Parser::new("SELECT MAX(age) FROM table1;");
+        parser = Parser::new("SELECT MAX(age) FROM table1 GROUP BY age HAVING MAX(age) = 5;");
         let statement = parser.parse_select().unwrap();
         assert_eq!(
             statement,
@@ -1092,6 +1154,13 @@ mod tests {
                     name: "table1".to_string()
                 },
                 filter: None,
+                groupby: Some((
+                    vec![Expression::Field("age".to_string())],
+                    Some(Expression::Operation(Operation::Equal(
+                        Box::new(Expression::Function(Aggregate::Max, "age".to_string())),
+                        Box::new(Expression::Constant(Constant::Integer(5))),
+                    )))
+                )),
                 ordering: vec![],
                 limit: None,
                 offset: None,

@@ -87,6 +87,8 @@ pub enum Keyword {
     On,
     Inner,
     Full,
+    Group,
+    Having,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -136,6 +138,8 @@ impl TryFrom<&str> for Keyword {
             "ON" => Keyword::On,
             "INNER" => Keyword::Inner,
             "FULL" => Keyword::Full,
+            "GROUP" => Keyword::Group,
+            "HAVING" => Keyword::Having,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -195,6 +199,8 @@ impl Display for Keyword {
             Keyword::On => "ON",
             Keyword::Inner => "INNER",
             Keyword::Full => "FULL",
+            Keyword::Group => "GROUP",
+            Keyword::Having => "HAVING",
         })
     }
 }

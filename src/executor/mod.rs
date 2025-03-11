@@ -6,7 +6,7 @@ use join::{hash_join, loop_join};
 use crate::{
     engine::{Engine, Transaction},
     error::{Error::InternalError, Result},
-    parser::ast::{Expression, JoinType, Ordering, SelectFrom, Statement},
+    parser::ast::{Expression, JoinType, Operation, Ordering, SelectFrom, Statement},
     schema::{Row, Table, Value},
     storage::Storage,
 };
@@ -77,12 +77,13 @@ impl<S: Storage> Executor<S> {
                 columns,
                 from,
                 filter,
+                groupby,
                 ordering,
                 limit,
                 offset,
             } => {
                 let (columns, rows) =
-                    self.select(columns, from, filter, ordering, limit, offset)?;
+                    self.select(columns, from, filter, groupby, ordering, limit, offset)?;
 
                 Ok(ExecuteResult::Scan { columns, rows })
             }
@@ -327,11 +328,13 @@ impl<S: Storage> Executor<S> {
     }
 
     /// 查询数据
+    #[allow(clippy::too_many_arguments)]
     fn select(
         &self,
         select_columns: Vec<(Expression, Option<String>)>,
         from: SelectFrom,
         filter: Option<(String, Expression)>,
+        groupby: Option<(Vec<Expression>, Option<Expression>)>,
         ordering: Vec<(String, Ordering)>,
         limit: Option<Expression>,
         offset: Option<Expression>,
@@ -359,36 +362,40 @@ impl<S: Storage> Executor<S> {
                 .collect::<Vec<_>>();
         }
 
-        // 处理不是 SELECT * 的情况
-        if !select_columns.is_empty() {
-            // column 可以全部是聚集函数，或者全部是列名，不允许出现混合的情况
-            if select_columns.iter().all(|(col, _)| col.is_function()) {
-                // 全部是聚集函数
-                let (new_columns, new_rows) =
-                    Self::select_aggregate_columns(&select_columns, &columns, &rows)?;
-
-                Ok((new_columns, new_rows))
-            } else if select_columns.iter().all(|(col, _)| col.is_field()) {
-                // 全是列名
-                let (new_columns, new_rows) =
-                    self.select_field_columns(&select_columns, &columns, rows)?;
-
-                Ok((new_columns, new_rows))
-            } else {
-                // 既有聚集函数又有列名，报错
-                Err(InternalError(
-                    "All columns must be either aggregate functions or column names".to_string(),
-                ))
+        // 如果是 SELECT *，直接返回
+        if select_columns.is_empty() {
+            // 如果有 GROUP BY，必须有聚集函数
+            if groupby.is_some() {
+                return Err(InternalError(
+                    "GROUP BY must have aggregate function".to_string(),
+                ));
             }
-        } else {
             // 将列名从 table_name.col_name 改为 col_name
             let columns = columns
                 .into_iter()
                 .map(|full_name| Self::extract_column_name(&full_name).to_string())
                 .collect();
 
-            Ok((columns, rows))
+            return Ok((columns, rows));
         }
+
+        // 如果没有聚集函数和 GROUP BY，直接选择列名
+        if select_columns.iter().all(|(col, _)| col.is_field()) {
+            if groupby.is_some() {
+                return Err(InternalError(
+                    "GROUP BY must have aggregate function".to_string(),
+                ));
+            }
+
+            let (new_columns, new_rows) =
+                self.select_field_columns(&select_columns, &columns, rows)?;
+            return Ok((new_columns, new_rows));
+        }
+
+        // 如果有聚集函数
+        let (new_columns, new_rows) =
+            Self::select_aggregate_columns(&select_columns, &columns, rows, groupby)?;
+        Ok((new_columns, new_rows))
     }
 
     /// 选择列名
@@ -435,8 +442,26 @@ impl<S: Storage> Executor<S> {
     fn select_aggregate_columns(
         select_columns: &[(Expression, Option<String>)],
         columns: &[String],
-        rows: &[Row],
+        rows: Vec<Row>,
+        groupby: Option<(Vec<Expression>, Option<Expression>)>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
+        // 解析 GROUP BY，可以是 None，也可以是一个或多个字段
+        let group_names = groupby
+            .as_ref()
+            .map(|(group, _)| {
+                group
+                    .iter()
+                    .map(|expr| match expr {
+                        Expression::Field(col_name) => Ok(col_name),
+                        _ => Err(InternalError(format!(
+                            "Unsupported column {:?} in GROUP BY",
+                            expr
+                        ))),
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+
         // 一次性收集新列名
         let new_columns = select_columns
             .iter()
@@ -444,20 +469,97 @@ impl<S: Storage> Executor<S> {
                 Expression::Function(agg, col_name) => Ok(alias
                     .clone()
                     .unwrap_or_else(|| format!("{}({})", agg, col_name))),
-                _ => unreachable!(),
+                Expression::Field(col_name) => {
+                    // 列名必须在 GROUP BY 中
+                    if group_names.is_none() || !group_names.as_ref().unwrap().contains(&col_name) {
+                        return Err(InternalError(format!(
+                            "Column {} must be in GROUP BY",
+                            col_name,
+                        )));
+                    }
+                    Ok(alias.clone().unwrap_or_else(|| col_name.clone()))
+                }
+                others => Err(InternalError(format!(
+                    "Unsupported column {:?} in SELECT",
+                    others
+                ))),
             })
             .collect::<Result<Vec<String>>>()?;
 
-        // 计算聚集函数的值
-        let agg_values = select_columns
-            .iter()
-            .map(|(col, _)| match col {
-                Expression::Function(agg, col_name) => aggregate(col_name, columns, rows, *agg),
-                _ => unreachable!(),
-            })
-            .collect::<Result<Vec<Value>>>()?;
+        // 如果没有 GROUP BY，直接计算聚集函数的值
+        if group_names.is_none() {
+            let agg_values = select_columns
+                .iter()
+                .map(|(col, _)| match col {
+                    Expression::Function(agg, col_name) => {
+                        aggregate(col_name, columns, &rows, *agg)
+                    }
+                    _ => unreachable!(),
+                })
+                .collect::<Result<Vec<Value>>>()?;
 
-        Ok((new_columns, vec![agg_values]))
+            return Ok((new_columns, vec![agg_values]));
+        }
+
+        // 如果有 GROUP BY，按照 GROUP BY 列进行分组
+        let group_indices = group_names
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|group_name| Self::get_column_index_by_name(columns, group_name))
+            .collect::<Result<Vec<_>>>()?;
+        let mut group_map: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
+        for row in rows {
+            let group_key = group_indices
+                .iter()
+                .map(|&group_idx| row[group_idx].clone())
+                .collect::<Vec<_>>();
+            group_map.entry(group_key).or_default().push(row);
+        }
+
+        // 计算聚集函数的值
+        let group_index_map = group_names
+            .as_ref()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, group_name)| (group_name, i))
+            .collect::<HashMap<_, _>>();
+        let mut new_rows = group_map
+            .into_iter()
+            .map(|(group_keys, group_rows)| {
+                let agg_values = select_columns
+                    .iter()
+                    .map(|(col, _)| match col {
+                        Expression::Function(agg, col_name) => {
+                            aggregate(col_name, columns, &group_rows, *agg)
+                        }
+                        // 列一定等于 GROUP BY 列，因为在上面的 match 中已经处理
+                        Expression::Field(col_name) => {
+                            Ok(group_keys[group_index_map[&col_name]].clone())
+                        }
+                        // 不可能出现其他情况，在上面的 match 中已经处理
+                        _ => unreachable!(),
+                    })
+                    .collect::<Result<Vec<Value>>>()?;
+                Ok(agg_values)
+            })
+            .collect::<Result<Vec<Row>>>()?;
+
+        // 过滤不符合 HAVING 条件的行
+        if let Some(Expression::Operation(op)) = &groupby.as_ref().unwrap().1 {
+            match op {
+                // 目前只支持 EQUAL 操作
+                Operation::Equal(col, val) => {
+                    let col_idx = select_columns.iter().position(|(c, _)| *c == **col).ok_or(
+                        InternalError(format!("Column {:?} not found in SELECT", col)),
+                    )?;
+                    new_rows.retain(|row| row[col_idx] == Value::from(*val.clone()));
+                }
+            }
+        }
+
+        Ok((new_columns, new_rows))
     }
 
     /// 根据列名查找列索引
@@ -497,7 +599,7 @@ impl<S: Storage> Executor<S> {
                         col_name
                     )))
             }
-            _ => panic!(), // 不可能出现其他情况
+            _ => unreachable!("More than 2 dots in column name"), // 不可能出现其他情况
         }
     }
 
@@ -628,6 +730,10 @@ mod tests {
                     Expression::Constant(Constant::String("Bob".to_string())),
                     Expression::Constant(Constant::Integer(80)),
                 ],
+                vec![
+                    Expression::Constant(Constant::String("Charlie".to_string())),
+                    Expression::Constant(Constant::Integer(80)),
+                ],
             ],
         })?;
 
@@ -714,6 +820,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -734,6 +841,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -751,6 +859,7 @@ mod tests {
                 name: "users".to_string(),
             },
             Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            None,
             vec![],
             None,
             None,
@@ -768,6 +877,7 @@ mod tests {
                 name: "users".to_string(),
             },
             Some(("name".to_string(), Expression::Constant(Constant::Null))),
+            None,
             vec![],
             None,
             None,
@@ -781,6 +891,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![("name".to_string(), Ordering::Desc)],
             None,
@@ -802,6 +913,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![("name".to_string(), Ordering::Asc)],
             None,
             None,
@@ -822,6 +934,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             Some(Expression::Constant(Constant::Integer(1))),
             None,
@@ -838,6 +951,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![],
             Some(Expression::Constant(Constant::Integer(1))),
@@ -875,6 +989,7 @@ mod tests {
                 name: "users".to_string(),
             },
             Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            None,
             vec![],
             None,
             None,
@@ -908,6 +1023,7 @@ mod tests {
                 name: "users".to_string(),
             },
             Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            None,
             vec![],
             None,
             None,
@@ -938,11 +1054,13 @@ mod tests {
                 predicate: None,
             },
             None,
+            None,
             vec![],
             None,
             None,
         )?;
         assert_eq!(columns, vec!["id", "name", "name", "grade"]);
+        assert_eq!(rows.len(), 6);
         assert!(rows.contains(&vec![
             Value::Integer(1),
             Value::String("Alice".to_string()),
@@ -966,6 +1084,18 @@ mod tests {
             Value::Null,
             Value::String("Alice".to_string()),
             Value::Integer(90)
+        ]));
+        assert!(rows.contains(&vec![
+            Value::Integer(1),
+            Value::String("Alice".to_string()),
+            Value::String("Charlie".to_string()),
+            Value::Integer(80)
+        ]));
+        assert!(rows.contains(&vec![
+            Value::Integer(2),
+            Value::Null,
+            Value::String("Charlie".to_string()),
+            Value::Integer(80)
         ]));
 
         Ok(())
@@ -995,6 +1125,7 @@ mod tests {
                     "name".to_string(),
                     Expression::Constant(Constant::String("Alice".to_string()))
                 )),
+                None,
                 vec![],
                 None,
                 None,
@@ -1015,6 +1146,7 @@ mod tests {
                     join_type: JoinType::Cross,
                     predicate: None,
                 },
+                None,
                 None,
                 vec![("name".to_string(), Ordering::Asc)],
                 None,
@@ -1039,6 +1171,7 @@ mod tests {
                 "users.name".to_string(),
                 Expression::Constant(Constant::String("Alice".to_string())),
             )),
+            None,
             vec![(String::from("grades.name"), Ordering::Asc)],
             None,
             None,
@@ -1057,6 +1190,12 @@ mod tests {
                     Value::Integer(1),
                     Value::String("Alice".to_string()),
                     Value::String("Bob".to_string()),
+                    Value::Integer(80)
+                ],
+                vec![
+                    Value::Integer(1),
+                    Value::String("Alice".to_string()),
+                    Value::String("Charlie".to_string()),
                     Value::Integer(80)
                 ],
             ]
@@ -1087,6 +1226,7 @@ mod tests {
                     Box::new(Expression::Field("grades.name".to_string())),
                 ))),
             },
+            None,
             None,
             vec![],
             None,
@@ -1128,6 +1268,7 @@ mod tests {
                     Box::new(Expression::Field("grades.name".to_string())),
                 ))),
             },
+            None,
             None,
             vec![("grades.name".to_string(), Ordering::Asc)],
             None,
@@ -1173,6 +1314,7 @@ mod tests {
                 ))),
             },
             None,
+            None,
             vec![("grades.name".to_string(), Ordering::Asc)],
             None,
             None,
@@ -1191,6 +1333,12 @@ mod tests {
                     Value::Null,
                     Value::Null,
                     Value::String("Bob".to_string()),
+                    Value::Integer(80),
+                ],
+                vec![
+                    Value::Null,
+                    Value::Null,
+                    Value::String("Charlie".to_string()),
                     Value::Integer(80),
                 ],
             ]
@@ -1222,6 +1370,7 @@ mod tests {
                 ))),
             },
             None,
+            None,
             vec![("grades.name".to_string(), Ordering::Asc)],
             None,
             None,
@@ -1241,6 +1390,12 @@ mod tests {
                     Value::Null,
                     Value::Null,
                     Value::String("Bob".to_string()),
+                    Value::Integer(80)
+                ],
+                vec![
+                    Value::Null,
+                    Value::Null,
+                    Value::String("Charlie".to_string()),
                     Value::Integer(80)
                 ],
             ]
@@ -1265,6 +1420,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -1281,6 +1437,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![],
             None,
@@ -1299,6 +1456,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -1312,6 +1470,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![],
             None,
@@ -1327,6 +1486,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -1341,6 +1501,7 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
@@ -1354,6 +1515,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![],
             None,
@@ -1371,6 +1533,7 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
+            None,
             None,
             vec![],
             None,
@@ -1390,12 +1553,200 @@ mod tests {
                 name: "users".to_string(),
             },
             None,
+            None,
             vec![],
             None,
             None,
         )?;
         assert_eq!(columns, vec!["min_id"]);
         assert_eq!(rows, vec![vec![Value::Integer(1)]]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_with_group_by() -> Result<()> {
+        let executor = init_executor()?;
+        create_tables(&executor)?;
+        insert_data(&executor)?;
+
+        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("grade".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    Some("count".to_string()),
+                ),
+            ],
+            SelectFrom::Table {
+                name: "grades".to_string(),
+            },
+            None,
+            Some((vec![Expression::Field("grade".to_string())], None)),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["grade", "count"]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&vec![Value::Integer(90), Value::Integer(1)]));
+        assert!(rows.contains(&vec![Value::Integer(80), Value::Integer(2)]));
+
+        // 测试 SELECT grade, COUNT(*) AS count, MAX(name) FROM grades GROUP BY grade
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("grade".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    Some("count".to_string()),
+                ),
+                (
+                    Expression::Function(Aggregate::Max, "name".to_string()),
+                    None,
+                ),
+            ],
+            SelectFrom::Table {
+                name: "grades".to_string(),
+            },
+            None,
+            Some((vec![Expression::Field("grade".to_string())], None)),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["grade", "count", "MAX(name)"]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&vec![
+            Value::Integer(90),
+            Value::Integer(1),
+            Value::String("Alice".to_string())
+        ]));
+        assert!(rows.contains(&vec![
+            Value::Integer(80),
+            Value::Integer(2),
+            Value::String("Charlie".to_string())
+        ]));
+
+        // 测试错误情况：SELECT name, COUNT(*) AS count FROM users GROUP BY id
+        assert!(executor
+            .select(
+                vec![
+                    (Expression::Field("name".to_string()), None),
+                    (
+                        Expression::Function(Aggregate::Count, "*".to_string()),
+                        Some("count".to_string()),
+                    ),
+                ],
+                SelectFrom::Table {
+                    name: "users".to_string(),
+                },
+                None,
+                Some((vec![Expression::Field("id".to_string())], None)),
+                vec![],
+                None,
+                None,
+            )
+            .is_err());
+
+        // 测试多个 GROUP BY 列
+        // 测试 SELECT name, grade, COUNT(*) AS count FROM grades GROUP BY name, grade
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("name".to_string()), None),
+                (Expression::Field("grade".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    Some("count".to_string()),
+                ),
+            ],
+            SelectFrom::Table {
+                name: "grades".to_string(),
+            },
+            None,
+            Some((
+                vec![
+                    Expression::Field("name".to_string()),
+                    Expression::Field("grade".to_string()),
+                ],
+                None,
+            )),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["name", "grade", "count"]);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.contains(&vec![
+            Value::String("Alice".to_string()),
+            Value::Integer(90),
+            Value::Integer(1)
+        ]));
+        assert!(rows.contains(&vec![
+            Value::String("Bob".to_string()),
+            Value::Integer(80),
+            Value::Integer(1)
+        ]));
+        assert!(rows.contains(&vec![
+            Value::String("Charlie".to_string()),
+            Value::Integer(80),
+            Value::Integer(1)
+        ]));
+
+        // 测试 HAVING 语句
+        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING grade = 80
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("grade".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    Some("count".to_string()),
+                ),
+            ],
+            SelectFrom::Table {
+                name: "grades".to_string(),
+            },
+            None,
+            Some((
+                vec![Expression::Field("grade".to_string())],
+                Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("grade".to_string())),
+                    Box::new(Expression::Constant(Constant::Integer(80))),
+                ))),
+            )),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["grade", "count"]);
+        assert_eq!(rows, vec![vec![Value::Integer(80), Value::Integer(2)]]);
+
+        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING COUNT(*) = 2
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("grade".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Count, "*".to_string()),
+                    Some("count".to_string()),
+                ),
+            ],
+            SelectFrom::Table {
+                name: "grades".to_string(),
+            },
+            None,
+            Some((
+                vec![Expression::Field("grade".to_string())],
+                Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Function(Aggregate::Count, "*".to_string())),
+                    Box::new(Expression::Constant(Constant::Integer(2))),
+                ))),
+            )),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["grade", "count"]);
+        assert_eq!(rows, vec![vec![Value::Integer(80), Value::Integer(2)]]);
 
         Ok(())
     }

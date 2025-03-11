@@ -67,7 +67,7 @@ impl Expression {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum Aggregate {
     Count,
     Sum,
@@ -183,6 +183,7 @@ pub enum Statement {
         columns: Vec<(Expression, Option<String>)>,
         from: SelectFrom,
         filter: Option<(String, Expression)>,
+        groupby: Option<(Vec<Expression>, Option<Expression>)>,
         ordering: Vec<(String, Ordering)>,
         limit: Option<Expression>,
         offset: Option<Expression>,
