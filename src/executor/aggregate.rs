@@ -1,3 +1,4 @@
+use super::get_column_index_by_name;
 use crate::{
     error::Error::InternalError,
     parser::ast::Aggregate,
@@ -15,17 +16,11 @@ pub fn aggregate(col_name: &str, cols: &[String], rows: &[Row], agg: Aggregate) 
     }
 }
 
-fn find_column_index(col_name: &str, cols: &[String]) -> Result<usize> {
-    cols.iter()
-        .position(|col| col == col_name)
-        .ok_or(InternalError(format!("Column {} not found", col_name)))
-}
-
 fn count(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
     let count = if col_name == "*" {
         rows.len()
     } else {
-        let col_idx = find_column_index(col_name, cols)?;
+        let col_idx = get_column_index_by_name(cols, col_name)?;
         rows.iter()
             .filter(|row| row[col_idx] != Value::Null)
             .count()
@@ -35,7 +30,7 @@ fn count(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
 }
 
 fn sum(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = find_column_index(col_name, cols)?;
+    let col_idx = get_column_index_by_name(cols, col_name)?;
     let mut sum = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -65,7 +60,7 @@ fn sum(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
 }
 
 fn min(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = find_column_index(col_name, cols)?;
+    let col_idx = get_column_index_by_name(cols, col_name)?;
     let mut min = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -98,7 +93,7 @@ fn min(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
 }
 
 fn max(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = find_column_index(col_name, cols)?;
+    let col_idx = get_column_index_by_name(cols, col_name)?;
     let mut max = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -131,7 +126,7 @@ fn max(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
 }
 
 fn avg(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = find_column_index(col_name, cols)?;
+    let col_idx = get_column_index_by_name(cols, col_name)?;
     let mut sum = 0.0;
     let mut count = 0;
     for row in rows {

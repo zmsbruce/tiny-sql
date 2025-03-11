@@ -272,14 +272,16 @@ impl<S: Storage> Executor<S> {
 
                 // 对列名添加表名前缀，以便后续处理时能够识别
                 if let SelectFrom::Table { ref name } = **left {
-                    left_columns.iter_mut().for_each(|col| {
-                        *col = format!("{}.{}", name, col);
-                    });
+                    left_columns = left_columns
+                        .into_iter()
+                        .map(|col| Self::add_table_name_prefix(name, &col))
+                        .collect();
                 }
                 if let SelectFrom::Table { ref name } = **right {
-                    right_columns.iter_mut().for_each(|col| {
-                        *col = format!("{}.{}", name, col);
-                    });
+                    right_columns = right_columns
+                        .into_iter()
+                        .map(|col| Self::add_table_name_prefix(name, &col))
+                        .collect();
                 }
 
                 // 合并左右表
@@ -312,19 +314,11 @@ impl<S: Storage> Executor<S> {
 
         // 列名称在 `scan_all_from_join` 中改为 table_name.col_name，利用这个特性进行过滤
         if let Some((col_name, expr)) = filter {
-            let col_idx = Self::get_column_index_by_name(&columns, &col_name)?;
+            let col_idx = get_column_index_by_name(&columns, &col_name)?;
             rows.retain(|row| row[col_idx] == Value::from(expr.clone()));
         }
 
         Ok((columns, rows))
-    }
-
-    /// 从 `table_name.column_name` 中提取 `column_name`
-    fn extract_column_name(full_column_name: &str) -> &str {
-        full_column_name
-            .split('.')
-            .last()
-            .unwrap_or(full_column_name)
     }
 
     /// 查询数据
@@ -420,7 +414,7 @@ impl<S: Storage> Executor<S> {
         let col_indices = select_columns
             .iter()
             .map(|(col_expr, _)| match col_expr {
-                Expression::Field(col_name) => Self::get_column_index_by_name(columns, col_name),
+                Expression::Field(col_name) => get_column_index_by_name(columns, col_name),
                 _ => unreachable!(),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -506,7 +500,7 @@ impl<S: Storage> Executor<S> {
             .as_ref()
             .unwrap()
             .iter()
-            .map(|group_name| Self::get_column_index_by_name(columns, group_name))
+            .map(|group_name| get_column_index_by_name(columns, group_name))
             .collect::<Result<Vec<_>>>()?;
         let mut group_map: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
         for row in rows {
@@ -552,7 +546,7 @@ impl<S: Storage> Executor<S> {
                 // 目前只支持 EQUAL 操作
                 Operation::Equal(col, val) => {
                     let col_idx = select_columns.iter().position(|(c, _)| *c == **col).ok_or(
-                        InternalError(format!("Column {:?} not found in SELECT", col)),
+                        InternalError(format!("HAVING {:?} not found in columns", col)),
                     )?;
                     new_rows.retain(|row| row[col_idx] == Value::from(*val.clone()));
                 }
@@ -560,47 +554,6 @@ impl<S: Storage> Executor<S> {
         }
 
         Ok((new_columns, new_rows))
-    }
-
-    /// 根据列名查找列索引
-    ///
-    /// columns 为 table_name.col_name 的形式，col_name 可能为 col_name 或 table_name.col_name
-    fn get_column_index_by_name(columns: &[String], col_name: &str) -> Result<usize> {
-        let parts = col_name.split('.').collect::<Vec<_>>();
-        match parts.len() {
-            1 => {
-                // 仅包含 col_name，则按照最后部分匹配
-                let matches = columns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, full_name)| full_name.split('.').last().unwrap() == parts[0])
-                    .collect::<Vec<_>>();
-                if matches.len() == 1 {
-                    Ok(matches[0].0)
-                } else if matches.is_empty() {
-                    Err(InternalError(format!(
-                        "Column {} not found in table",
-                        col_name
-                    )))
-                } else {
-                    Err(InternalError(format!(
-                        "Column {} is ambiguous in table",
-                        col_name
-                    )))
-                }
-            }
-            2 => {
-                // 包含 table_name.col_name，则直接查找
-                columns
-                    .iter()
-                    .position(|full_name| full_name == col_name)
-                    .ok_or(InternalError(format!(
-                        "Column {} not found in table",
-                        col_name
-                    )))
-            }
-            _ => unreachable!("More than 2 dots in column name"), // 不可能出现其他情况
-        }
     }
 
     /// 对行进行排序
@@ -614,7 +567,7 @@ impl<S: Storage> Executor<S> {
         let ordering = ordering
             .into_iter()
             .map(|(col_name, ord)| {
-                Self::get_column_index_by_name(columns, &col_name).map(|col_idx| (col_idx, ord))
+                get_column_index_by_name(columns, &col_name).map(|col_idx| (col_idx, ord))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -635,6 +588,62 @@ impl<S: Storage> Executor<S> {
         });
 
         Ok(())
+    }
+
+    /// 从 `table_name.column_name` 中提取 `column_name`
+    #[inline]
+    fn extract_column_name(full_column_name: &str) -> &str {
+        full_column_name
+            .split('.')
+            .last()
+            .unwrap_or(full_column_name)
+    }
+
+    /// 将 `column_name` 添加 `table_name` 前缀
+    #[inline]
+    fn add_table_name_prefix(table_name: &str, column_name: &str) -> String {
+        format!("{}.{}", table_name, column_name)
+    }
+}
+
+/// 根据列名查找列索引
+///
+/// columns 为 table_name.col_name 的形式，col_name 可能为 col_name 或 table_name.col_name
+fn get_column_index_by_name(columns: &[String], col_name: &str) -> Result<usize> {
+    let parts = col_name.split('.').collect::<Vec<_>>();
+    match parts.len() {
+        1 => {
+            // 仅包含 col_name，则按照最后部分匹配
+            let matches = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, full_name)| full_name.split('.').last().unwrap() == parts[0])
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                Ok(matches[0].0)
+            } else if matches.is_empty() {
+                Err(InternalError(format!(
+                    "Column {} not found in table",
+                    col_name
+                )))
+            } else {
+                Err(InternalError(format!(
+                    "Column {} is ambiguous in table",
+                    col_name
+                )))
+            }
+        }
+        2 => {
+            // 包含 table_name.col_name，则直接查找
+            columns
+                .iter()
+                .position(|full_name| full_name == col_name)
+                .ok_or(InternalError(format!(
+                    "Column {} not found in table",
+                    col_name
+                )))
+        }
+        _ => unreachable!("More than 2 dots in column name"), // 不可能出现其他情况
     }
 }
 
@@ -1747,6 +1756,92 @@ mod tests {
         )?;
         assert_eq!(columns, vec!["grade", "count"]);
         assert_eq!(rows, vec![vec![Value::Integer(80), Value::Integer(2)]]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_with_join() -> Result<()> {
+        let executor = init_executor()?;
+        create_tables(&executor)?;
+        insert_data(&executor)?;
+
+        // 测试 SELECT users.name, MAX(grade) FROM users CROSS JOIN grades GROUP BY users.name
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("users.name".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Max, "grade".to_string()),
+                    None,
+                ),
+            ],
+            SelectFrom::Join {
+                left: Box::new(SelectFrom::Table {
+                    name: "users".to_string(),
+                }),
+                right: Box::new(SelectFrom::Table {
+                    name: "grades".to_string(),
+                }),
+                join_type: JoinType::Cross,
+                predicate: None,
+            },
+            None,
+            Some((vec![Expression::Field("users.name".to_string())], None)),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["users.name", "MAX(grade)"]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&vec![
+            Value::String("Alice".to_string()),
+            Value::Integer(90)
+        ]));
+        assert!(rows.contains(&vec![Value::Null, Value::Integer(90)]));
+
+        // 测试 SELECT users.name, MAX(grades.grade) FROM users RIGHT JOIN grades GROUP BY users.name HAVING MAX(grades.grade) = 90
+        let (columns, rows) = executor.select(
+            vec![
+                (Expression::Field("users.name".to_string()), None),
+                (
+                    Expression::Function(Aggregate::Max, "grades.grade".to_string()),
+                    None,
+                ),
+            ],
+            SelectFrom::Join {
+                left: Box::new(SelectFrom::Table {
+                    name: "users".to_string(),
+                }),
+                right: Box::new(SelectFrom::Table {
+                    name: "grades".to_string(),
+                }),
+                join_type: JoinType::Right,
+                predicate: Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("users.name".to_string())),
+                    Box::new(Expression::Field("grades.name".to_string())),
+                ))),
+            },
+            None,
+            Some((
+                vec![Expression::Field("users.name".to_string())],
+                Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Function(
+                        Aggregate::Max,
+                        "grades.grade".to_string(),
+                    )),
+                    Box::new(Expression::Constant(Constant::Integer(90))),
+                ))),
+            )),
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["users.name", "MAX(grades.grade)"]);
+
+        assert_eq!(
+            rows,
+            vec![vec![Value::String("Alice".to_string()), Value::Integer(90)]]
+        );
 
         Ok(())
     }
