@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    parser::ast::Expression,
     schema::{Row, Table, Value},
     storage::{Mvcc, MvccTxn, Storage},
     Error::InternalError,
@@ -132,31 +131,14 @@ impl<S: Storage> Transaction<S> {
     }
 
     /// 扫描表
-    pub fn scan_table(
-        &self,
-        table: &Table,
-        filter: Option<(String, Expression)>,
-    ) -> Result<Vec<Row>> {
+    pub fn scan_table(&self, table: &Table) -> Result<Vec<Row>> {
         let prefix = KeyPrefix::Row(table.name.clone());
-        let result = self.txn.scan_prefix(&bincode::serialize(&prefix)?)?;
-
-        let mut rows = Vec::new();
-        for (_, value) in result {
-            let row: Row = bincode::deserialize(&value)?;
-            // 如果有过滤条件，检查是否符合条件
-            if let Some((col, expr)) = &filter {
-                let col_idx = table.get_col_idx(col).ok_or(InternalError(format!(
-                    "Column {} not found in table {}",
-                    col, table.name
-                )))?;
-                if Value::from(expr.clone()) != row[col_idx] {
-                    continue;
-                }
-            }
-            rows.push(row);
-        }
-
-        Ok(rows)
+        let rows = self.txn.scan_prefix(&bincode::serialize(&prefix)?)?;
+        rows.into_iter()
+            .map(|(_, value)| {
+                bincode::deserialize(&value).map_err(|e| InternalError(e.to_string()))
+            })
+            .collect::<Result<Vec<Row>>>()
     }
 
     /// 更新行数据
@@ -203,7 +185,6 @@ impl<S: Storage> Transaction<S> {
 mod tests {
     use super::*;
     use crate::{
-        parser::ast::Constant,
         schema::{Column, DataType},
         storage::MemoryStorage,
     };
@@ -260,19 +241,8 @@ mod tests {
             txn.create_row("users", row).unwrap();
         }
 
-        let rows_scan = txn.scan_table(&table, None).unwrap();
+        let rows_scan = txn.scan_table(&table).unwrap();
         assert_eq!(rows_scan, rows);
-
-        let rows_scan = txn
-            .scan_table(
-                &table,
-                Some((
-                    "id".to_string(),
-                    Expression::Constant(Constant::Integer(42)),
-                )),
-            )
-            .unwrap();
-        assert_eq!(rows_scan.len(), 1);
 
         txn.update_row(
             &table,
@@ -280,7 +250,7 @@ mod tests {
             &vec![Value::Integer(42), Value::String("zmsbruceee".to_string())],
         )
         .unwrap();
-        let rows_scan = txn.scan_table(&table, None).unwrap();
+        let rows_scan = txn.scan_table(&table).unwrap();
         assert_eq!(
             rows_scan,
             vec![
@@ -293,7 +263,7 @@ mod tests {
         );
 
         txn.delete_row(&table, &Value::Integer(42)).unwrap();
-        let rows_scan = txn.scan_table(&table, None).unwrap();
+        let rows_scan = txn.scan_table(&table).unwrap();
         assert_eq!(
             rows_scan,
             vec![vec![

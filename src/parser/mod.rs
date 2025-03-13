@@ -1,7 +1,7 @@
 use std::{collections::HashMap, iter::Peekable};
 
 use crate::{
-    schema::{Column, DataType},
+    schema::{Column, DataType, Value},
     Error::ParseError,
     Result,
 };
@@ -121,16 +121,12 @@ impl<'a> Parser<'a> {
         self.next_token_equal(Token::Keyword(Keyword::Select))?; // 期望下一个 token 是 SELECT
 
         // 获取列名，如果是 *，则表示选择所有列
-        let columns = self.parse_select_columns()?;
+        let columns = self.parse_columns()?;
 
-        let from = self.parse_select_from()?; // 解析 FROM 子句
+        let from = self.parse_from()?; // 解析 FROM 子句
 
         // 如果有 WHERE 子句，则解析 WHERE 子句
-        let filter = self
-            .next_token_equal(Token::Keyword(Keyword::Where))
-            .ok()
-            .map(|_| self.parse_where_clause())
-            .transpose()?;
+        let filter = self.parse_where()?;
 
         // 如果有 GROUP BY 子句，则解析 GROUP BY 子句
         let groupby = self.parse_group_by()?;
@@ -162,7 +158,7 @@ impl<'a> Parser<'a> {
 
     /// 解析 SELECT 语句的 FROM 子句
     /// 语法：`FROM table_name [CROSS JOIN table_name ...]`
-    fn parse_select_from(&mut self) -> Result<SelectFrom> {
+    fn parse_from(&mut self) -> Result<SelectFrom> {
         self.next_token_equal(Token::Keyword(Keyword::From))?; // 期望下一个 token 是 FROM
 
         let mut select_from = SelectFrom::Table {
@@ -243,14 +239,13 @@ impl<'a> Parser<'a> {
             }
             // 如果没有指定 JOIN 类型，默认为 INNER JOIN
             Token::Keyword(Keyword::Join) => Ok(JoinType::Inner),
-            // matches! 宏已经保证了 token 的类型，因此不可能出现其他类型的 token
             _ => unreachable!(),
         }
     }
 
     /// 解析 SELECT 语句的列名
     /// 语法：`[* | col_name [ [AS] output_name [, ...] ]`
-    fn parse_select_columns(&mut self) -> Result<Vec<(Expression, Option<String>)>> {
+    fn parse_columns(&mut self) -> Result<Vec<(Expression, Option<String>)>> {
         let mut columns = Vec::new();
         if self.next_token_equal(Token::Asterisk).is_err() {
             loop {
@@ -361,14 +356,7 @@ impl<'a> Parser<'a> {
         }
 
         // 如果有 WHERE 子句，则解析 WHERE 子句
-        let filter = if self
-            .next_token_equal(Token::Keyword(Keyword::Where))
-            .is_ok()
-        {
-            Some(self.parse_where_clause()?)
-        } else {
-            None
-        };
+        let filter = self.parse_where()?;
 
         Ok(Statement::Update {
             table_name,
@@ -379,13 +367,118 @@ impl<'a> Parser<'a> {
 
     /// 解析 WHERE 子句
     /// 语法：`WHERE column_name = expression`
-    ///
-    /// 目前只支持单个表达式且仅为等于操作，不支持其他操作符和表达式组合
-    fn parse_where_clause(&mut self) -> Result<(String, Expression)> {
+    fn parse_where(&mut self) -> Result<Option<Expression>> {
+        if self
+            .next_token_equal(Token::Keyword(Keyword::Where))
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let op = self.parse_condition()?;
+        Ok(Some(Expression::Operation(op)))
+    }
+
+    /// 解析逻辑条件表达式，支持 AND、OR 和括号，作为 WHERE 子句的解析入口
+    fn parse_condition(&mut self) -> Result<Operation> {
+        self.parse_or()
+    }
+
+    /// 解析 OR 表达式，最低优先级
+    fn parse_or(&mut self) -> Result<Operation> {
+        let mut expr = self.parse_and()?;
+        while self.next_token_equal(Token::Keyword(Keyword::Or)).is_ok() {
+            let right = self.parse_and()?;
+            expr = Operation::Or(Box::new(expr), Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    /// 解析 AND 表达式，中间优先级
+    fn parse_and(&mut self) -> Result<Operation> {
+        let mut expr = self.parse_comparison()?;
+        while self.next_token_equal(Token::Keyword(Keyword::And)).is_ok() {
+            let right = self.parse_comparison()?;
+            expr = Operation::And(Box::new(expr), Box::new(right));
+        }
+        Ok(expr)
+    }
+
+    /// 解析单个比较表达式，或者括号内的表达式，最高优先级
+    fn parse_comparison(&mut self) -> Result<Operation> {
+        // 如果遇到左括号，则解析括号内的表达式
+        if self.next_token_equal(Token::OpenParen).is_ok() {
+            let expr = self.parse_condition()?;
+            self.next_token_equal(Token::CloseParen)?;
+            return Ok(expr);
+        }
+
+        // 原来的单个比较表达式解析逻辑
         let col_name = self.next_identifier()?;
-        self.next_token_equal(Token::Equal)?;
-        let val = self.parse_expression()?;
-        Ok((col_name, val))
+        match self.next_token_if(|token| {
+            matches!(
+                token,
+                Token::Equal
+                    | Token::Greater
+                    | Token::Less
+                    | Token::Exclaim
+                    | Token::Keyword(Keyword::Is)
+            )
+        })? {
+            Token::Equal => Ok(Operation::Equal(
+                Box::new(Expression::Field(col_name)),
+                Box::new(self.parse_expression()?),
+            )),
+            Token::Greater => {
+                if self.next_token_equal(Token::Equal).is_ok() {
+                    Ok(Operation::GreaterEqual(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(self.parse_expression()?),
+                    ))
+                } else {
+                    Ok(Operation::Greater(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(self.parse_expression()?),
+                    ))
+                }
+            }
+            Token::Less => {
+                if self.next_token_equal(Token::Equal).is_ok() {
+                    Ok(Operation::LessEqual(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(self.parse_expression()?),
+                    ))
+                } else {
+                    Ok(Operation::Less(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(self.parse_expression()?),
+                    ))
+                }
+            }
+            Token::Exclaim => {
+                self.next_token_equal(Token::Equal)?;
+                Ok(Operation::Not(Box::new(Operation::Equal(
+                    Box::new(Expression::Field(col_name)),
+                    Box::new(self.parse_expression()?),
+                ))))
+            }
+            Token::Keyword(Keyword::Is) => {
+                // IS NULL 或 IS NOT NULL
+                if self.next_token_equal(Token::Keyword(Keyword::Null)).is_ok() {
+                    Ok(Operation::Equal(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(Expression::Constant(Constant::Null)),
+                    ))
+                } else {
+                    self.next_token_equal(Token::Keyword(Keyword::Not))?;
+                    self.next_token_equal(Token::Keyword(Keyword::Null))?;
+                    Ok(Operation::Not(Box::new(Operation::Equal(
+                        Box::new(Expression::Field(col_name)),
+                        Box::new(Expression::Constant(Constant::Null)),
+                    ))))
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// 解析 DELETE 语句
@@ -396,11 +489,7 @@ impl<'a> Parser<'a> {
         let table_name = self.next_identifier()?;
 
         // 如果有 WHERE 子句，则解析 WHERE 子句
-        let filter = self
-            .next_token_equal(Token::Keyword(Keyword::Where))
-            .ok()
-            .map(|_| self.parse_where_clause())
-            .transpose()?;
+        let filter = self.parse_where()?;
 
         Ok(Statement::Delete { table_name, filter })
     }
@@ -444,7 +533,7 @@ impl<'a> Parser<'a> {
                     self.next_token_equal(Token::Keyword(Keyword::Null))?;
                 }
                 // 如果是 DEFAULT，则期望下一个 token 是一个表达式，设置列的默认值
-                Keyword::Default => column.default = Some(self.parse_expression()?.into()),
+                Keyword::Default => column.default = Some(Value::from(&self.parse_expression()?)),
                 // 如果是 PRIMARY KEY，则设置列为主键
                 Keyword::Primary => {
                     self.next_token_equal(Token::Keyword(Keyword::Key))?;
@@ -594,6 +683,8 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::Value;
+
     use super::*;
 
     #[test]
@@ -664,7 +755,7 @@ mod tests {
     #[test]
     fn test_select_columns() {
         let mut parser = Parser::new("name, id");
-        let columns = parser.parse_select_columns().unwrap();
+        let columns = parser.parse_columns().unwrap();
         assert_eq!(
             columns,
             vec![
@@ -674,7 +765,7 @@ mod tests {
         );
 
         parser = Parser::new("name AS user_name, id AS user_id");
-        let columns = parser.parse_select_columns().unwrap();
+        let columns = parser.parse_columns().unwrap();
         assert_eq!(
             columns,
             vec![
@@ -690,11 +781,11 @@ mod tests {
         );
 
         parser = Parser::new("*");
-        let columns = parser.parse_select_columns().unwrap();
+        let columns = parser.parse_columns().unwrap();
         assert_eq!(columns, vec![]);
 
         parser = Parser::new("name AS user_name, id");
-        let columns = parser.parse_select_columns().unwrap();
+        let columns = parser.parse_columns().unwrap();
         assert_eq!(
             columns,
             vec![
@@ -710,7 +801,7 @@ mod tests {
     #[test]
     fn test_select_from() {
         let mut parser = Parser::new("FROM table1");
-        let from = parser.parse_select_from().unwrap();
+        let from = parser.parse_from().unwrap();
         assert_eq!(
             from,
             SelectFrom::Table {
@@ -719,7 +810,7 @@ mod tests {
         );
 
         parser = Parser::new("FROM table1 CROSS JOIN table2");
-        let from = parser.parse_select_from().unwrap();
+        let from = parser.parse_from().unwrap();
         assert_eq!(
             from,
             SelectFrom::Join {
@@ -736,7 +827,7 @@ mod tests {
 
         parser =
             Parser::new("FROM table1 FULL JOIN table2 ON table1.name = table2.name INNER JOIN table3 ON table1.id = table2.id");
-        let from = parser.parse_select_from().unwrap();
+        let from = parser.parse_from().unwrap();
         assert_eq!(
             from,
             SelectFrom::Join {
@@ -797,7 +888,10 @@ mod tests {
                         Box::new(Expression::Field("table2.name".to_string())),
                     ))),
                 },
-                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+                filter: Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("id".to_string())),
+                    Box::new(Expression::Constant(Constant::Integer(1)))
+                ))),
                 groupby: None,
                 ordering: vec![
                     ("name".to_string(), Ordering::Desc),
@@ -839,7 +933,9 @@ mod tests {
                 name: "name".to_string(),
                 data_type: DataType::String,
                 nullable: false,
-                default: Some(Expression::Constant(Constant::String("hello".to_string())).into()),
+                default: Some(Value::from(&Expression::Constant(Constant::String(
+                    "hello".to_string()
+                )))),
                 primary_key: true,
             }
         );
@@ -883,9 +979,9 @@ mod tests {
                     name: "name".to_string(),
                     data_type: DataType::String,
                     nullable: true,
-                    default: Some(
-                        Expression::Constant(Constant::String("hello".to_string())).into()
-                    ),
+                    default: Some(Value::from(&Expression::Constant(Constant::String(
+                        "hello".to_string()
+                    )))),
                     primary_key: false,
                 }],
             }
@@ -962,11 +1058,14 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+                filter: Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("id".to_string())),
+                    Box::new(Expression::Constant(Constant::Integer(1)))
+                ))),
             }
         );
 
-        parser = Parser::new("UPDATE table1 SET name = 'hello', age = 18 WHERE id = 1");
+        parser = Parser::new("UPDATE table1 SET name = 'hello', age = 18 WHERE id >= 1");
         let statement = parser.parse_update().unwrap();
         assert_eq!(
             statement,
@@ -984,11 +1083,14 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+                filter: Some(Expression::Operation(Operation::GreaterEqual(
+                    Box::new(Expression::Field("id".to_string())),
+                    Box::new(Expression::Constant(Constant::Integer(1)))
+                ))),
             }
         );
 
-        parser = Parser::new("UPDATE table1 SET name = 'hello' WHERE id = 1 AND age = 18");
+        parser = Parser::new("UPDATE table1 SET name = 'hello' WHERE id <= 1 AND age = 18");
         let statement = parser.parse_update().unwrap();
         assert_eq!(
             statement,
@@ -1000,7 +1102,16 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
-                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+                filter: Some(Expression::Operation(Operation::And(
+                    Box::new(Operation::LessEqual(
+                        Box::new(Expression::Field("id".to_string())),
+                        Box::new(Expression::Constant(Constant::Integer(1)))
+                    )),
+                    Box::new(Operation::Equal(
+                        Box::new(Expression::Field("age".to_string())),
+                        Box::new(Expression::Constant(Constant::Integer(18)))
+                    )),
+                ))),
             }
         );
 
@@ -1023,13 +1134,22 @@ mod tests {
 
     #[test]
     fn test_parse_delete() {
-        let mut parser = Parser::new("DELETE FROM table1 WHERE id = 1");
+        let mut parser = Parser::new("DELETE FROM table1 WHERE id < 0 OR name IS NULL");
         let statement = parser.parse_delete().unwrap();
         assert_eq!(
             statement,
             Statement::Delete {
                 table_name: "table1".to_string(),
-                filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1))),),
+                filter: Some(Expression::Operation(Operation::Or(
+                    Box::new(Operation::Less(
+                        Box::new(Expression::Field("id".to_string())),
+                        Box::new(Expression::Constant(Constant::Integer(0)))
+                    )),
+                    Box::new(Operation::Equal(
+                        Box::new(Expression::Field("name".to_string())),
+                        Box::new(Expression::Constant(Constant::Null))
+                    ))
+                ))),
             }
         );
 

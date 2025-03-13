@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{error::Error::ParseError, schema::Column};
+use crate::{error::Error::ParseError, schema::Column, Result};
 
 /// 常量定义
 #[derive(PartialEq, Debug, Clone)]
@@ -19,6 +19,18 @@ pub enum Expression {
     Constant(Constant),
     Operation(Operation),
     Function(Aggregate, String),
+}
+
+impl From<Constant> for Expression {
+    fn from(constant: Constant) -> Self {
+        Expression::Constant(constant)
+    }
+}
+
+impl From<Operation> for Expression {
+    fn from(operation: Operation) -> Self {
+        Expression::Operation(operation)
+    }
 }
 
 impl Expression {
@@ -91,7 +103,7 @@ impl Display for Aggregate {
 impl TryFrom<String> for Aggregate {
     type Error = crate::Error;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(value: String) -> Result<Self> {
         match value.to_ascii_lowercase().as_str() {
             "count" => Ok(Aggregate::Count),
             "sum" => Ok(Aggregate::Sum),
@@ -106,6 +118,13 @@ impl TryFrom<String> for Aggregate {
 #[derive(PartialEq, Debug, Clone)]
 pub enum Operation {
     Equal(Box<Expression>, Box<Expression>),
+    Greater(Box<Expression>, Box<Expression>),
+    Less(Box<Expression>, Box<Expression>),
+    GreaterEqual(Box<Expression>, Box<Expression>),
+    LessEqual(Box<Expression>, Box<Expression>),
+    And(Box<Operation>, Box<Operation>),
+    Or(Box<Operation>, Box<Operation>),
+    Not(Box<Operation>),
 }
 
 /// 排序方式
@@ -182,7 +201,7 @@ pub enum Statement {
     Select {
         columns: Vec<(Expression, Option<String>)>,
         from: SelectFrom,
-        filter: Option<(String, Expression)>,
+        filter: Option<Expression>,
         groupby: Option<(Vec<Expression>, Option<Expression>)>,
         ordering: Vec<(String, Ordering)>,
         limit: Option<Expression>,
@@ -191,10 +210,10 @@ pub enum Statement {
     Update {
         table_name: String,
         columns: HashMap<String, Expression>,
-        filter: Option<(String, Expression)>,
+        filter: Option<Expression>,
     },
     Delete {
         table_name: String,
-        filter: Option<(String, Expression)>,
+        filter: Option<Expression>,
     },
 }

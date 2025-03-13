@@ -63,6 +63,18 @@ impl Value {
     }
 }
 
+impl From<&Constant> for Value {
+    fn from(constant: &Constant) -> Self {
+        match constant {
+            Constant::Null => Self::Null,
+            Constant::Boolean(b) => Self::Boolean(*b),
+            Constant::Integer(i) => Self::Integer(*i),
+            Constant::Float(f) => Self::Float(*f),
+            Constant::String(s) => Self::String(s.clone()),
+        }
+    }
+}
+
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
@@ -106,15 +118,15 @@ impl Hash for Value {
 
 impl Eq for Value {}
 
-impl From<Expression> for Value {
+impl From<&Expression> for Value {
     /// 将表达式转为值
-    fn from(expr: Expression) -> Self {
+    fn from(expr: &Expression) -> Self {
         match expr {
             Expression::Constant(c) => match c {
-                Constant::Boolean(b) => Value::Boolean(b),
-                Constant::Float(f) => Value::Float(f),
-                Constant::Integer(i) => Value::Integer(i),
-                Constant::String(s) => Value::String(s),
+                Constant::Boolean(b) => Value::Boolean(*b),
+                Constant::Float(f) => Value::Float(*f),
+                Constant::Integer(i) => Value::Integer(*i),
+                Constant::String(s) => Value::String(s.clone()),
                 Constant::Null => Value::Null,
             },
             _ => panic!("Cannot convert non-constant expression to value"),

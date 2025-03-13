@@ -118,11 +118,7 @@ impl<S: Storage> Executor<S> {
     }
 
     /// 扫描表
-    fn scan(
-        &self,
-        table_name: &str,
-        filter: Option<(String, Expression)>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    fn scan(&self, table_name: &str) -> Result<(Vec<String>, Vec<Row>)> {
         let table = self
             .transaction
             .get_table(table_name)?
@@ -130,7 +126,7 @@ impl<S: Storage> Executor<S> {
 
         let columns = table.columns.iter().map(|c| c.name.clone()).collect();
 
-        let rows = self.transaction.scan_table(&table, filter)?;
+        let rows = self.transaction.scan_table(&table)?;
 
         Ok((columns, rows))
     }
@@ -177,7 +173,7 @@ impl<S: Storage> Executor<S> {
                 .map(|column| {
                     if let Some(exp) = value_map.get(&column.name) {
                         // 如果找到对应的值，将其转为 Value
-                        Ok(Value::from(exp.clone()))
+                        Ok(Value::from(exp))
                     } else if let Some(default) = &column.default {
                         // 如果未找到对应的值，但存在默认值，使用默认值
                         Ok(default.clone())
@@ -203,28 +199,31 @@ impl<S: Storage> Executor<S> {
         &self,
         table_name: String,
         columns: HashMap<String, Expression>,
-        filter: Option<(String, Expression)>,
+        filter: Option<Expression>,
     ) -> Result<usize> {
         let table = self
             .transaction
             .get_table(&table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
-        let (_, rows) = self.scan(&table_name, filter)?;
+
+        // 扫描并过滤数据
+        let (col_names, rows) = self.scan(&table_name)?;
+        let rows = Self::filter_rows(rows, &col_names, filter)?;
 
         let mut updated_count = 0;
         for row in rows {
-            let mut updated_row = row.clone();
-            let primary_key = table.get_primary_key(&row);
+            let primary_key = table.get_primary_key(&row).clone();
+            let mut updated_row = row;
 
             for (col_name, expr) in &columns {
                 let col_idx = table.get_col_idx(col_name).ok_or(InternalError(format!(
                     "Column {} not found in table {}",
                     col_name, table_name
                 )))?;
-                updated_row[col_idx] = Value::from(expr.clone());
+                updated_row[col_idx] = Value::from(expr);
             }
             self.transaction
-                .update_row(&table, primary_key, &updated_row)?;
+                .update_row(&table, &primary_key, &updated_row)?;
             updated_count += 1;
         }
 
@@ -232,12 +231,15 @@ impl<S: Storage> Executor<S> {
     }
 
     /// 删除数据
-    fn delete(&self, table_name: String, filter: Option<(String, Expression)>) -> Result<usize> {
+    fn delete(&self, table_name: String, filter: Option<Expression>) -> Result<usize> {
         let table = self
             .transaction
             .get_table(&table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
-        let (_, rows) = self.scan(&table_name, filter)?;
+
+        // 扫描并过滤数据
+        let (columns, rows) = self.scan(&table_name)?;
+        let rows = Self::filter_rows(rows, &columns, filter)?;
 
         let mut delete_count = 0;
         for row in rows {
@@ -250,9 +252,19 @@ impl<S: Storage> Executor<S> {
     }
 
     /// 扫描 Join 表，返回所有的列名和行数据
-    fn scan_all_from_join(&self, from: &SelectFrom) -> Result<(Vec<String>, Vec<Row>)> {
+    fn scan_from_join(&self, from: &SelectFrom) -> Result<(Vec<String>, Vec<Row>)> {
         match from {
-            SelectFrom::Table { name } => self.scan(name, None),
+            SelectFrom::Table { name } => {
+                let (columns, rows) = self.scan(name)?;
+
+                // 添加表名前缀，以便后续处理时能够识别
+                let columns = columns
+                    .into_iter()
+                    .map(|col_name| Self::add_table_name_prefix(name, &col_name))
+                    .collect();
+
+                Ok((columns, rows))
+            }
             SelectFrom::Join {
                 left,
                 right,
@@ -267,22 +279,8 @@ impl<S: Storage> Executor<S> {
                     )));
                 }
 
-                let (mut left_columns, left_rows) = self.scan_all_from_join(left)?;
-                let (mut right_columns, right_rows) = self.scan_all_from_join(right)?;
-
-                // 对列名添加表名前缀，以便后续处理时能够识别
-                if let SelectFrom::Table { ref name } = **left {
-                    left_columns = left_columns
-                        .into_iter()
-                        .map(|col| Self::add_table_name_prefix(name, &col))
-                        .collect();
-                }
-                if let SelectFrom::Table { ref name } = **right {
-                    right_columns = right_columns
-                        .into_iter()
-                        .map(|col| Self::add_table_name_prefix(name, &col))
-                        .collect();
-                }
+                let (left_columns, left_rows) = self.scan_from_join(left)?;
+                let (right_columns, right_rows) = self.scan_from_join(right)?;
 
                 // 合并左右表
                 match join_type {
@@ -304,21 +302,80 @@ impl<S: Storage> Executor<S> {
         }
     }
 
-    /// 从 Join 表中扫描数据并过滤
-    fn scan_from_join(
-        &self,
-        from: &SelectFrom,
-        filter: Option<(String, Expression)>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
-        let (columns, mut rows) = self.scan_all_from_join(from)?;
+    /// 计算表达式的值
+    pub fn evaluate(op: &Operation, columns: &[String], row: &[Value]) -> Result<bool> {
+        let get_field_and_value =
+            |left: &Expression, right: &Expression, columns: &[String]| -> Result<(usize, Value)> {
+                let col_name = match left {
+                    Expression::Field(name) => name,
+                    Expression::Function(agg, col_name) => &format!("{}({})", agg, col_name),
+                    _ => {
+                        return Err(InternalError(format!(
+                            "Unsupported left expression {:?}",
+                            left
+                        )))
+                    }
+                };
+                let idx = get_column_index_by_name(columns, col_name)?;
+                let value = Value::from(right);
 
-        // 列名称在 `scan_all_from_join` 中改为 table_name.col_name，利用这个特性进行过滤
-        if let Some((col_name, expr)) = filter {
-            let col_idx = get_column_index_by_name(&columns, &col_name)?;
-            rows.retain(|row| row[col_idx] == Value::from(expr.clone()));
+                Ok((idx, value))
+            };
+
+        match op {
+            Operation::And(left_op, right_op) => {
+                Ok(Self::evaluate(left_op, columns, row)?
+                    && Self::evaluate(right_op, columns, row)?)
+            }
+            Operation::Or(left_op, right_op) => {
+                Ok(Self::evaluate(left_op, columns, row)?
+                    || Self::evaluate(right_op, columns, row)?)
+            }
+            Operation::Not(op) => Ok(!Self::evaluate(op, columns, row)?),
+            Operation::Equal(left, right) => {
+                let (idx, value) = get_field_and_value(left, right, columns)?;
+                Ok(row[idx] == value)
+            }
+            Operation::Greater(left, right) => {
+                let (idx, value) = get_field_and_value(left, right, columns)?;
+                Ok(row[idx] > value)
+            }
+            Operation::Less(left, right) => {
+                let (idx, value) = get_field_and_value(left, right, columns)?;
+                Ok(row[idx] < value)
+            }
+            Operation::GreaterEqual(left, right) => {
+                let (idx, value) = get_field_and_value(left, right, columns)?;
+                Ok(row[idx] >= value)
+            }
+            Operation::LessEqual(left, right) => {
+                let (idx, value) = get_field_and_value(left, right, columns)?;
+                Ok(row[idx] <= value)
+            }
         }
+    }
 
-        Ok((columns, rows))
+    /// 过滤行数据
+    fn filter_rows(
+        rows: Vec<Row>,
+        columns: &[String],
+        filter: Option<Expression>,
+    ) -> Result<Vec<Row>> {
+        if let Some(expr) = filter {
+            let op = expr.as_operation().ok_or(InternalError(format!(
+                "Unsupported filter expression {:?}",
+                expr
+            )))?;
+            let mut new_rows = Vec::new();
+            for row in rows {
+                if Self::evaluate(op, columns, &row)? {
+                    new_rows.push(row);
+                }
+            }
+            Ok(new_rows)
+        } else {
+            Ok(rows)
+        }
     }
 
     /// 查询数据
@@ -327,19 +384,25 @@ impl<S: Storage> Executor<S> {
         &self,
         select_columns: Vec<(Expression, Option<String>)>,
         from: SelectFrom,
-        filter: Option<(String, Expression)>,
+        filter: Option<Expression>,
         groupby: Option<(Vec<Expression>, Option<Expression>)>,
         ordering: Vec<(String, Ordering)>,
         limit: Option<Expression>,
         offset: Option<Expression>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
-        let (columns, mut rows) = self.scan_from_join(&from, filter)?;
-        self.sort_rows(&mut rows, &columns, ordering)?;
+        // 从 Join 表中扫描数据并过滤
+        let (columns, rows) = self.scan_from_join(&from)?;
+        let mut rows = Self::filter_rows(rows, &columns, filter)?;
+
+        // 处理排序
+        if !ordering.is_empty() {
+            self.sort_rows(&mut rows, &columns, ordering)?;
+        }
 
         // 处理 limit 和 offset
         if !(offset.is_none() && limit.is_none()) {
             let to_usize = |expr: Option<Expression>, default: usize, err_prefix: &str| {
-                expr.map_or(Ok(default), |e| match Value::from(e) {
+                expr.map_or(Ok(default), |e| match Value::from(&e) {
                     Value::Integer(v) if v >= 0 => Ok(v as usize),
                     other => Err(InternalError(format!(
                         "{} must be a non-negative integer, get {:?}",
@@ -519,7 +582,7 @@ impl<S: Storage> Executor<S> {
             .enumerate()
             .map(|(i, group_name)| (group_name, i))
             .collect::<HashMap<_, _>>();
-        let mut new_rows = group_map
+        let new_rows = group_map
             .into_iter()
             .map(|(group_keys, group_rows)| {
                 let agg_values = select_columns
@@ -541,17 +604,7 @@ impl<S: Storage> Executor<S> {
             .collect::<Result<Vec<Row>>>()?;
 
         // 过滤不符合 HAVING 条件的行
-        if let Some(Expression::Operation(op)) = &groupby.as_ref().unwrap().1 {
-            match op {
-                // 目前只支持 EQUAL 操作
-                Operation::Equal(col, val) => {
-                    let col_idx = select_columns.iter().position(|(c, _)| *c == **col).ok_or(
-                        InternalError(format!("HAVING {:?} not found in columns", col)),
-                    )?;
-                    new_rows.retain(|row| row[col_idx] == Value::from(*val.clone()));
-                }
-            }
-        }
+        let new_rows = Self::filter_rows(new_rows, &new_columns, groupby.unwrap().1)?;
 
         Ok((new_columns, new_rows))
     }
@@ -861,13 +914,42 @@ mod tests {
             vec![vec![Value::String("Alice".to_string())], vec![Value::Null],]
         );
 
-        // 测试 SELECT * FROM users WHERE id = 1
+        // 测试 SELECT * FROM users WHERE id >= 1
         let (columns, rows) = executor.select(
             vec![],
             SelectFrom::Table {
                 name: "users".to_string(),
             },
-            Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            Some(Expression::Operation(Operation::GreaterEqual(
+                Box::new(Expression::Field("id".to_string())),
+                Box::new(Expression::Constant(Constant::Integer(1))),
+            ))),
+            None,
+            vec![],
+            None,
+            None,
+        )?;
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Integer(1), Value::String("Alice".to_string())],
+                vec![Value::Integer(2), Value::Null],
+            ]
+        );
+
+        // 测试 SELECT * FROM users WHERE name IS NOT NULL
+        let (columns, rows) = executor.select(
+            vec![],
+            SelectFrom::Table {
+                name: "users".to_string(),
+            },
+            Some(Expression::Operation(Operation::Not(Box::new(
+                Operation::Equal(
+                    Box::new(Expression::Field("name".to_string())),
+                    Box::new(Expression::Constant(Constant::Null)),
+                ),
+            )))),
             None,
             vec![],
             None,
@@ -878,21 +960,6 @@ mod tests {
             rows,
             vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
         );
-
-        // 测试 SELECT * FROM users WHERE name IS NULL
-        let (columns, rows) = executor.select(
-            vec![],
-            SelectFrom::Table {
-                name: "users".to_string(),
-            },
-            Some(("name".to_string(), Expression::Constant(Constant::Null))),
-            None,
-            vec![],
-            None,
-            None,
-        )?;
-        assert_eq!(columns, vec!["id", "name"]);
-        assert_eq!(rows, vec![vec![Value::Integer(2), Value::Null]]);
 
         // 测试 SELECT * FROM users ORDER BY name DESC
         let (columns, rows) = executor.select(
@@ -987,7 +1054,10 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            filter: Some(Expression::Operation(Operation::Equal(
+                Box::new(Expression::Field("id".to_string())),
+                Box::new(Expression::Constant(Constant::Integer(1))),
+            ))),
         })?;
         assert_eq!(result, ExecuteResult::Update(1));
 
@@ -997,7 +1067,10 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
-            Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            Some(Expression::Operation(Operation::Equal(
+                Box::new(Expression::Field("id".to_string())),
+                Box::new(Expression::Constant(Constant::Integer(1))),
+            ))),
             None,
             vec![],
             None,
@@ -1021,7 +1094,10 @@ mod tests {
         // 测试删除数据
         let result = executor.execute(Statement::Delete {
             table_name: "users".to_string(),
-            filter: Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            filter: Some(Expression::Operation(Operation::Equal(
+                Box::new(Expression::Field("name".to_string())),
+                Box::new(Expression::Constant(Constant::Null)),
+            ))),
         })?;
         assert_eq!(result, ExecuteResult::Delete(1));
 
@@ -1031,14 +1107,20 @@ mod tests {
             SelectFrom::Table {
                 name: "users".to_string(),
             },
-            Some(("id".to_string(), Expression::Constant(Constant::Integer(1)))),
+            Some(Expression::Operation(Operation::Equal(
+                Box::new(Expression::Field("id".to_string())),
+                Box::new(Expression::Constant(Constant::Integer(1))),
+            ))),
             None,
             vec![],
             None,
             None,
         )?;
         assert_eq!(columns, vec!["id", "name"]);
-        assert!(rows.is_empty());
+        assert_eq!(
+            rows,
+            vec![vec![Value::Integer(1), Value::String("Alice".to_string())]]
+        );
 
         Ok(())
     }
@@ -1130,10 +1212,10 @@ mod tests {
                     join_type: JoinType::Cross,
                     predicate: None,
                 },
-                Some((
-                    "name".to_string(),
-                    Expression::Constant(Constant::String("Alice".to_string()))
-                )),
+                Some(Expression::Operation(Operation::Equal(
+                    Box::new(Expression::Field("name".to_string())),
+                    Box::new(Expression::Constant(Constant::String("Alice".to_string()))),
+                ))),
                 None,
                 vec![],
                 None,
@@ -1176,10 +1258,10 @@ mod tests {
                 join_type: JoinType::Cross,
                 predicate: None,
             },
-            Some((
-                "users.name".to_string(),
-                Expression::Constant(Constant::String("Alice".to_string())),
-            )),
+            Some(Expression::Operation(Operation::Equal(
+                Box::new(Expression::Field("users.name".to_string())),
+                Box::new(Expression::Constant(Constant::String("Alice".to_string()))),
+            ))),
             None,
             vec![(String::from("grades.name"), Ordering::Asc)],
             None,
@@ -1730,7 +1812,7 @@ mod tests {
         assert_eq!(columns, vec!["grade", "count"]);
         assert_eq!(rows, vec![vec![Value::Integer(80), Value::Integer(2)]]);
 
-        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING COUNT(*) = 2
+        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING count = 2
         let (columns, rows) = executor.select(
             vec![
                 (Expression::Field("grade".to_string()), None),
@@ -1746,7 +1828,7 @@ mod tests {
             Some((
                 vec![Expression::Field("grade".to_string())],
                 Some(Expression::Operation(Operation::Equal(
-                    Box::new(Expression::Function(Aggregate::Count, "*".to_string())),
+                    Box::new(Expression::Field("count".to_string())),
                     Box::new(Expression::Constant(Constant::Integer(2))),
                 ))),
             )),

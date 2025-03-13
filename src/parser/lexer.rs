@@ -21,6 +21,9 @@ pub enum Token {
     Minus,              // 减号 -
     Slash,              // 斜杠 /
     Equal,              // 等号 =
+    Greater,            // 大于号 >
+    Less,               // 小于号 <
+    Exclaim,            // 感叹号 !
 }
 
 impl Display for Token {
@@ -39,6 +42,9 @@ impl Display for Token {
             Token::Minus => write!(f, "-"),
             Token::Slash => write!(f, "/"),
             Token::Equal => write!(f, "="),
+            Token::Greater => write!(f, ">"),
+            Token::Less => write!(f, "<"),
+            Token::Exclaim => write!(f, "!"),
         }
     }
 }
@@ -89,6 +95,9 @@ pub enum Keyword {
     Full,
     Group,
     Having,
+    And,
+    Or,
+    Is,
 }
 
 impl TryFrom<&str> for Keyword {
@@ -140,6 +149,9 @@ impl TryFrom<&str> for Keyword {
             "FULL" => Keyword::Full,
             "GROUP" => Keyword::Group,
             "HAVING" => Keyword::Having,
+            "AND" => Keyword::And,
+            "OR" => Keyword::Or,
+            "IS" => Keyword::Is,
             keyword => return Err(ParseError(format!("Invalid keyword {keyword}"))),
         };
         Ok(keyword)
@@ -201,6 +213,9 @@ impl Display for Keyword {
             Keyword::Full => "FULL",
             Keyword::Group => "GROUP",
             Keyword::Having => "HAVING",
+            Keyword::And => "AND",
+            Keyword::Or => "OR",
+            Keyword::Is => "IS",
         })
     }
 }
@@ -294,7 +309,7 @@ impl<'a> Lexer<'a> {
             .map_or_else(|_| Token::Identifier(s.to_lowercase()), Token::Keyword))
     }
 
-    /// 扫描符号，Token 必须为 `*(),;+-/` 中的一个，否则返回 `ParseError`。
+    /// 扫描符号，Token 必须为 `*(),;+-/>=<` 中的一个，否则返回 `ParseError`。
     fn scan_symbol(&mut self) -> Result<Token> {
         let sym = self
             .iter
@@ -309,6 +324,9 @@ impl<'a> Lexer<'a> {
                 '-' => Some(Token::Minus),
                 '/' => Some(Token::Slash),
                 '=' => Some(Token::Equal),
+                '>' => Some(Token::Greater),
+                '<' => Some(Token::Less),
+                '!' => Some(Token::Exclaim),
                 _ => None,
             })
             .ok_or(ParseError("Expect a symbol".to_string()))?;
