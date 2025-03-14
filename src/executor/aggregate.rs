@@ -1,4 +1,4 @@
-use super::get_column_index_by_name;
+use super::{get_column_index, Column};
 use crate::{
     error::Error::InternalError,
     parser::ast::Aggregate,
@@ -6,21 +6,32 @@ use crate::{
     Result,
 };
 
-pub fn aggregate(col_name: &str, cols: &[String], rows: &[Row], agg: Aggregate) -> Result<Value> {
-    match agg {
-        Aggregate::Count => count(col_name, cols, rows),
-        Aggregate::Sum => sum(col_name, cols, rows),
-        Aggregate::Min => min(col_name, cols, rows),
-        Aggregate::Max => max(col_name, cols, rows),
-        Aggregate::Avg => avg(col_name, cols, rows),
+pub fn aggregate(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    if let Some(agg) = col.agg {
+        // 将聚集函数设置为空，从而在 cols 中查找列索引聚集起来
+        let mut col = col.clone();
+        col.agg = None;
+
+        match agg {
+            Aggregate::Count => count(&col, cols, rows),
+            Aggregate::Sum => sum(&col, cols, rows),
+            Aggregate::Min => min(&col, cols, rows),
+            Aggregate::Max => max(&col, cols, rows),
+            Aggregate::Avg => avg(&col, cols, rows),
+        }
+    } else {
+        Err(InternalError(format!(
+            "Column {:?} does not have an aggregate function",
+            col
+        )))
     }
 }
 
-fn count(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let count = if col_name == "*" {
+fn count(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    let count = if col.col_name == "*" {
         rows.len()
     } else {
-        let col_idx = get_column_index_by_name(cols, col_name)?;
+        let col_idx = get_column_index(cols, col)?;
         rows.iter()
             .filter(|row| row[col_idx] != Value::Null)
             .count()
@@ -29,8 +40,8 @@ fn count(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
     Ok(Value::Integer(count))
 }
 
-fn sum(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = get_column_index_by_name(cols, col_name)?;
+fn sum(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    let col_idx = get_column_index(cols, col)?;
     let mut sum = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -59,8 +70,8 @@ fn sum(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
     Ok(sum)
 }
 
-fn min(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = get_column_index_by_name(cols, col_name)?;
+fn min(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    let col_idx = get_column_index(cols, col)?;
     let mut min = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -92,8 +103,8 @@ fn min(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
     Ok(min)
 }
 
-fn max(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = get_column_index_by_name(cols, col_name)?;
+fn max(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    let col_idx = get_column_index(cols, col)?;
     let mut max = Value::Null;
     for row in rows {
         match &row[col_idx] {
@@ -125,8 +136,8 @@ fn max(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
     Ok(max)
 }
 
-fn avg(col_name: &str, cols: &[String], rows: &[Row]) -> Result<Value> {
-    let col_idx = get_column_index_by_name(cols, col_name)?;
+fn avg(col: &Column, cols: &[Column], rows: &[Row]) -> Result<Value> {
+    let col_idx = get_column_index(cols, col)?;
     let mut sum = 0.0;
     let mut count = 0;
     for row in rows {

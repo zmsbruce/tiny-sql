@@ -533,7 +533,9 @@ impl<'a> Parser<'a> {
                     self.next_token_equal(Token::Keyword(Keyword::Null))?;
                 }
                 // 如果是 DEFAULT，则期望下一个 token 是一个表达式，设置列的默认值
-                Keyword::Default => column.default = Some(Value::from(&self.parse_expression()?)),
+                Keyword::Default => {
+                    column.default = Some(Value::try_from(&self.parse_expression()?)?)
+                }
                 // 如果是 PRIMARY KEY，则设置列为主键
                 Keyword::Primary => {
                     self.next_token_equal(Token::Keyword(Keyword::Key))?;
@@ -933,9 +935,10 @@ mod tests {
                 name: "name".to_string(),
                 data_type: DataType::String,
                 nullable: false,
-                default: Some(Value::from(&Expression::Constant(Constant::String(
-                    "hello".to_string()
-                )))),
+                default: Some(
+                    Value::try_from(&Expression::Constant(Constant::String("hello".to_string())))
+                        .unwrap()
+                ),
                 primary_key: true,
             }
         );
@@ -979,9 +982,12 @@ mod tests {
                     name: "name".to_string(),
                     data_type: DataType::String,
                     nullable: true,
-                    default: Some(Value::from(&Expression::Constant(Constant::String(
-                        "hello".to_string()
-                    )))),
+                    default: Some(
+                        Value::try_from(&Expression::Constant(Constant::String(
+                            "hello".to_string()
+                        )))
+                        .unwrap()
+                    ),
                     primary_key: false,
                 }],
             }

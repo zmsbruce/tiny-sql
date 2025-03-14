@@ -1,6 +1,11 @@
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{error::Error::ParseError, schema::Column, Result};
+use crate::{
+    error::Error::ParseError,
+    executor::get_column_index,
+    schema::{Column, Value},
+    Result,
+};
 
 /// 常量定义
 #[derive(PartialEq, Debug, Clone)]
@@ -12,6 +17,18 @@ pub enum Constant {
     String(String),
 }
 
+impl Display for Constant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Constant::Null => write!(f, "NULL"),
+            Constant::Boolean(value) => write!(f, "{}", value),
+            Constant::Integer(value) => write!(f, "{}", value),
+            Constant::Float(value) => write!(f, "{}", value),
+            Constant::String(value) => write!(f, "{}", value),
+        }
+    }
+}
+
 /// 表达式定义
 #[derive(PartialEq, Debug, Clone)]
 pub enum Expression {
@@ -19,6 +36,17 @@ pub enum Expression {
     Constant(Constant),
     Operation(Operation),
     Function(Aggregate, String),
+}
+
+impl Display for Expression {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expression::Field(name) => write!(f, "{}", name),
+            Expression::Constant(constant) => write!(f, "{}", constant),
+            Expression::Operation(operation) => write!(f, "{}", operation),
+            Expression::Function(agg, alias) => write!(f, "{}({})", agg, alias),
+        }
+    }
 }
 
 impl From<Constant> for Expression {
@@ -125,6 +153,68 @@ pub enum Operation {
     And(Box<Operation>, Box<Operation>),
     Or(Box<Operation>, Box<Operation>),
     Not(Box<Operation>),
+}
+
+impl Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Operation::Equal(left, right) => write!(f, "{} = {}", left, right),
+            Operation::Greater(left, right) => write!(f, "{} > {}", left, right),
+            Operation::Less(left, right) => write!(f, "{} < {}", left, right),
+            Operation::GreaterEqual(left, right) => write!(f, "{} >= {}", left, right),
+            Operation::LessEqual(left, right) => write!(f, "{} <= {}", left, right),
+            Operation::And(left, right) => write!(f, "{} AND {}", left, right),
+            Operation::Or(left, right) => write!(f, "{} OR {}", left, right),
+            Operation::Not(op) => write!(f, "NOT {}", op),
+        }
+    }
+}
+
+impl Operation {
+    pub fn evaluate(&self, columns: &[crate::executor::Column], row: &[Value]) -> Result<bool> {
+        let get_field_idx_and_val = |left: &Expression,
+                                     right: &Expression,
+                                     columns: &[crate::executor::Column]|
+         -> Result<(usize, Value)> {
+            let col = crate::executor::Column::try_from(left)?;
+            let idx = get_column_index(columns, &col)?;
+            let value = Value::try_from(right)?;
+
+            Ok((idx, value))
+        };
+
+        match self {
+            Operation::And(left_op, right_op) => {
+                Ok(Self::evaluate(left_op, columns, row)?
+                    && Self::evaluate(right_op, columns, row)?)
+            }
+            Operation::Or(left_op, right_op) => {
+                Ok(Self::evaluate(left_op, columns, row)?
+                    || Self::evaluate(right_op, columns, row)?)
+            }
+            Operation::Not(op) => Ok(!Self::evaluate(op, columns, row)?),
+            Operation::Equal(left, right) => {
+                let (idx, value) = get_field_idx_and_val(left, right, columns)?;
+                Ok(row[idx] == value)
+            }
+            Operation::Greater(left, right) => {
+                let (idx, value) = get_field_idx_and_val(left, right, columns)?;
+                Ok(row[idx] > value)
+            }
+            Operation::Less(left, right) => {
+                let (idx, value) = get_field_idx_and_val(left, right, columns)?;
+                Ok(row[idx] < value)
+            }
+            Operation::GreaterEqual(left, right) => {
+                let (idx, value) = get_field_idx_and_val(left, right, columns)?;
+                Ok(row[idx] >= value)
+            }
+            Operation::LessEqual(left, right) => {
+                let (idx, value) = get_field_idx_and_val(left, right, columns)?;
+                Ok(row[idx] <= value)
+            }
+        }
+    }
 }
 
 /// 排序方式

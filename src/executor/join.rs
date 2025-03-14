@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::Column;
 use crate::{
     error::Error::InternalError,
     parser::ast::{Expression, JoinType, Operation},
@@ -9,11 +10,11 @@ use crate::{
 
 /// 循环连接，将左右表的行进行笛卡尔积
 pub fn loop_join(
-    left_cols: &[String],
-    right_cols: &[String],
+    left_cols: &[Column],
+    right_cols: &[Column],
     left_rows: &[Row],
     right_rows: &[Row],
-) -> Result<(Vec<String>, Vec<Row>)> {
+) -> Result<(Vec<Column>, Vec<Row>)> {
     let new_columns = [left_cols, right_cols].concat();
     let new_rows: Vec<Row> = left_rows
         .iter()
@@ -30,19 +31,22 @@ pub fn loop_join(
 
 /// 哈希连接，根据 Join 条件将左右表的行合并
 pub fn hash_join(
-    left_cols: &[String],
-    right_cols: &[String],
+    left_cols: &[Column],
+    right_cols: &[Column],
     left_rows: &[Row],
     right_rows: &[Row],
     join_type: &JoinType,
     predicate: &Expression,
-) -> Result<(Vec<String>, Vec<Row>)> {
+) -> Result<(Vec<Column>, Vec<Row>)> {
     // 解析 Join 条件
     let (left_cond, right_cond) = match predicate {
         Expression::Operation(Operation::Equal(left, right))
             if left.is_field() && right.is_field() =>
         {
-            (left.as_field().unwrap(), right.as_field().unwrap())
+            (
+                Column::try_from(left.as_ref())?,
+                Column::try_from(right.as_ref())?,
+            )
         }
         _ => return Err(InternalError("Unsupported join condition".to_string())),
     };
@@ -50,12 +54,12 @@ pub fn hash_join(
     // 获取左右表的列索引
     let left_col_idx = left_cols
         .iter()
-        .position(|col| col == left_cond)
-        .ok_or(InternalError(format!("Column {} not found", left_cond)))?;
+        .position(|col| *col == left_cond)
+        .ok_or(InternalError(format!("Column {:?} not found", left_cond)))?;
     let right_col_idx = right_cols
         .iter()
-        .position(|col| col == right_cond)
-        .ok_or(InternalError(format!("Column {} not found", right_cond)))?;
+        .position(|col| *col == right_cond)
+        .ok_or(InternalError(format!("Column {:?} not found", right_cond)))?;
 
     // 合并左右表的列名
     let new_columns = [left_cols, right_cols].concat();

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Display};
 
 use aggregate::aggregate;
 use join::{hash_join, loop_join};
@@ -6,7 +6,7 @@ use join::{hash_join, loop_join};
 use crate::{
     engine::{Engine, Transaction},
     error::{Error::InternalError, Result},
-    parser::ast::{Expression, JoinType, Operation, Ordering, SelectFrom, Statement},
+    parser::ast::{Aggregate, Expression, JoinType, Ordering, SelectFrom, Statement},
     schema::{Row, Table, Value},
     storage::Storage,
 };
@@ -45,6 +45,134 @@ impl<S: Storage> Drop for Executor<S> {
             }
         }
     }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Column {
+    table_name: String,
+    col_name: String,
+    alias: Option<String>,
+    agg: Option<Aggregate>,
+}
+
+impl TryFrom<&str> for Column {
+    type Error = crate::Error;
+
+    fn try_from(name: &str) -> Result<Self> {
+        let mut column = Column::default();
+
+        // 可能包括聚集函数，表名和列名，比如 SUM(users.id)
+        // 先尝试解析聚集函数
+        let parts = name.split('(').collect::<Vec<_>>();
+        let col_name = if parts.len() == 2 {
+            // 如果包含聚集函数，解析聚集函数和列名
+            let agg = Aggregate::try_from(parts[0].to_string())?;
+            column.agg = Some(agg);
+
+            // 去掉右括号
+            Ok(parts[1].trim_end_matches(')'))
+        } else if parts.len() == 1 {
+            Ok(name)
+        } else {
+            // 如果包含多个左括号，报错
+            Err(InternalError(format!("Invalid column name {}", name)))
+        }?;
+
+        // 解析表名和列名
+        if !col_name.contains('.') {
+            // 如果是 col_name 的形式，只构建 col_name
+            column.col_name = col_name.to_string();
+        } else {
+            // 如果是 table_name.col_name 的形式，需要将 table_name 和 col_name 拆开
+            // 然后构建 table_name 和 col_name 字段
+            let parts = col_name.split('.').collect::<Vec<_>>();
+            if parts.len() != 2 {
+                return Err(InternalError(format!("Invalid column name {}", col_name)));
+            }
+            column.table_name = parts[0].to_string();
+            column.col_name = parts[1].to_string();
+        }
+
+        Ok(column)
+    }
+}
+
+impl TryFrom<&Expression> for Column {
+    type Error = crate::Error;
+
+    fn try_from(value: &Expression) -> Result<Self> {
+        match value {
+            // 如果是 Field，直接解析
+            Expression::Field(name) => Self::try_from(name.as_str()),
+            // 如果是 Function，解析聚集函数和列名
+            Expression::Function(agg, name) => {
+                let mut column = Self::try_from(name.as_str())?;
+                column.agg = Some(*agg);
+                Ok(column)
+            }
+            _ => Err(InternalError(format!("Unsupported expression {:?}", value))),
+        }
+    }
+}
+
+impl Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 首选 alias
+        if let Some(alias) = &self.alias {
+            write!(f, "{}", alias)
+        } else if let Some(agg) = self.agg {
+            // 如果是聚集函数
+            write!(f, "{}({})", agg, self.col_name)
+        } else {
+            // 不是的话，只返回列名
+            write!(f, "{}", self.col_name)
+        }
+    }
+}
+
+impl PartialEq for Column {
+    fn eq(&self, other: &Self) -> bool {
+        // 聚集函数和列名必须匹配
+        if self.agg != other.agg || self.col_name != other.col_name {
+            return false;
+        }
+        // 如果表名不为空，表名也必须匹配
+        if !self.table_name.is_empty() && self.table_name != other.table_name {
+            return false;
+        }
+        true
+    }
+}
+
+impl Eq for Column {}
+
+/// 获取列在 columns 中的索引
+pub fn get_column_index(columns: &[Column], col: &Column) -> Result<usize> {
+    let indices = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            // 列名和聚集函数必须匹配
+            if c.col_name != col.col_name || c.agg != col.agg {
+                return false;
+            }
+            // 如果表名不为空，必须匹配
+            if !col.table_name.is_empty() && c.table_name != col.table_name {
+                return false;
+            }
+            true
+        })
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+
+    // 如果没有找到或者找到多个匹配的列，报错
+    if indices.is_empty() {
+        return Err(InternalError(format!("Column {col} not found in table")));
+    } else if indices.len() > 1 {
+        return Err(InternalError(format!("Column {col} is ambiguous in table")));
+    }
+
+    Ok(indices[0])
 }
 
 impl<S: Storage> Executor<S> {
@@ -107,6 +235,7 @@ impl<S: Storage> Executor<S> {
     pub fn commit(&mut self) -> Result<()> {
         self.transaction.commit()?;
         self.is_committed = true;
+
         Ok(())
     }
 
@@ -114,18 +243,30 @@ impl<S: Storage> Executor<S> {
     #[inline]
     pub fn rollback(&mut self) -> Result<()> {
         self.transaction.rollback()?;
+
         Ok(())
     }
 
     /// 扫描表
-    fn scan(&self, table_name: &str) -> Result<(Vec<String>, Vec<Row>)> {
+    fn scan(&self, table_name: &str) -> Result<(Vec<Column>, Vec<Row>)> {
+        // 获取表的列定义
         let table = self
             .transaction
             .get_table(table_name)?
             .ok_or(InternalError(format!("Table {table_name} not found")))?;
 
-        let columns = table.columns.iter().map(|c| c.name.clone()).collect();
+        // 添加表名前缀，以便后续处理时能够识别列名
+        let columns = table
+            .columns
+            .iter()
+            .map(|col| Column {
+                table_name: table_name.to_string(),
+                col_name: col.name.clone(),
+                ..Default::default()
+            })
+            .collect();
 
+        // 扫描表中的所有行
         let rows = self.transaction.scan_table(&table)?;
 
         Ok((columns, rows))
@@ -173,7 +314,7 @@ impl<S: Storage> Executor<S> {
                 .map(|column| {
                     if let Some(exp) = value_map.get(&column.name) {
                         // 如果找到对应的值，将其转为 Value
-                        Ok(Value::from(exp))
+                        Value::try_from(exp)
                     } else if let Some(default) = &column.default {
                         // 如果未找到对应的值，但存在默认值，使用默认值
                         Ok(default.clone())
@@ -208,7 +349,7 @@ impl<S: Storage> Executor<S> {
 
         // 扫描并过滤数据
         let (col_names, rows) = self.scan(&table_name)?;
-        let rows = Self::filter_rows(rows, &col_names, filter)?;
+        let rows = self.filter_rows(rows, &col_names, filter)?;
 
         let mut updated_count = 0;
         for row in rows {
@@ -220,7 +361,7 @@ impl<S: Storage> Executor<S> {
                     "Column {} not found in table {}",
                     col_name, table_name
                 )))?;
-                updated_row[col_idx] = Value::from(expr);
+                updated_row[col_idx] = Value::try_from(expr)?;
             }
             self.transaction
                 .update_row(&table, &primary_key, &updated_row)?;
@@ -239,7 +380,7 @@ impl<S: Storage> Executor<S> {
 
         // 扫描并过滤数据
         let (columns, rows) = self.scan(&table_name)?;
-        let rows = Self::filter_rows(rows, &columns, filter)?;
+        let rows = self.filter_rows(rows, &columns, filter)?;
 
         let mut delete_count = 0;
         for row in rows {
@@ -252,17 +393,10 @@ impl<S: Storage> Executor<S> {
     }
 
     /// 扫描 Join 表，返回所有的列名和行数据
-    fn scan_from_join(&self, from: &SelectFrom) -> Result<(Vec<String>, Vec<Row>)> {
+    fn scan_from_join(&self, from: &SelectFrom) -> Result<(Vec<Column>, Vec<Row>)> {
         match from {
             SelectFrom::Table { name } => {
                 let (columns, rows) = self.scan(name)?;
-
-                // 添加表名前缀，以便后续处理时能够识别
-                let columns = columns
-                    .into_iter()
-                    .map(|col_name| Self::add_table_name_prefix(name, &col_name))
-                    .collect();
-
                 Ok((columns, rows))
             }
             SelectFrom::Join {
@@ -272,21 +406,21 @@ impl<S: Storage> Executor<S> {
                 predicate,
             } => {
                 // 除了 Cross Join 外，其他 Join 类型必须有 Join 条件
-                if join_type != &JoinType::Cross && predicate.is_none() {
-                    return Err(InternalError(format!(
-                        "{} must have a predicate",
-                        join_type
-                    )));
+                if *join_type != JoinType::Cross && predicate.is_none() {
+                    return Err(InternalError(format!("{join_type} must have a predicate")));
                 }
 
+                // 递归扫描左右表
                 let (left_columns, left_rows) = self.scan_from_join(left)?;
                 let (right_columns, right_rows) = self.scan_from_join(right)?;
 
                 // 合并左右表
                 match join_type {
+                    // Cross Join 直接笛卡尔积
                     JoinType::Cross => {
                         loop_join(&left_columns, &right_columns, &left_rows, &right_rows)
                     }
+                    // 否则使用哈希连接
                     JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
                         hash_join(
                             &left_columns,
@@ -302,73 +436,24 @@ impl<S: Storage> Executor<S> {
         }
     }
 
-    /// 计算表达式的值
-    pub fn evaluate(op: &Operation, columns: &[String], row: &[Value]) -> Result<bool> {
-        let get_field_and_value =
-            |left: &Expression, right: &Expression, columns: &[String]| -> Result<(usize, Value)> {
-                let col_name = match left {
-                    Expression::Field(name) => name,
-                    Expression::Function(agg, col_name) => &format!("{}({})", agg, col_name),
-                    _ => {
-                        return Err(InternalError(format!(
-                            "Unsupported left expression {:?}",
-                            left
-                        )))
-                    }
-                };
-                let idx = get_column_index_by_name(columns, col_name)?;
-                let value = Value::from(right);
-
-                Ok((idx, value))
-            };
-
-        match op {
-            Operation::And(left_op, right_op) => {
-                Ok(Self::evaluate(left_op, columns, row)?
-                    && Self::evaluate(right_op, columns, row)?)
-            }
-            Operation::Or(left_op, right_op) => {
-                Ok(Self::evaluate(left_op, columns, row)?
-                    || Self::evaluate(right_op, columns, row)?)
-            }
-            Operation::Not(op) => Ok(!Self::evaluate(op, columns, row)?),
-            Operation::Equal(left, right) => {
-                let (idx, value) = get_field_and_value(left, right, columns)?;
-                Ok(row[idx] == value)
-            }
-            Operation::Greater(left, right) => {
-                let (idx, value) = get_field_and_value(left, right, columns)?;
-                Ok(row[idx] > value)
-            }
-            Operation::Less(left, right) => {
-                let (idx, value) = get_field_and_value(left, right, columns)?;
-                Ok(row[idx] < value)
-            }
-            Operation::GreaterEqual(left, right) => {
-                let (idx, value) = get_field_and_value(left, right, columns)?;
-                Ok(row[idx] >= value)
-            }
-            Operation::LessEqual(left, right) => {
-                let (idx, value) = get_field_and_value(left, right, columns)?;
-                Ok(row[idx] <= value)
-            }
-        }
-    }
-
     /// 过滤行数据
     fn filter_rows(
+        &self,
         rows: Vec<Row>,
-        columns: &[String],
+        columns: &[Column],
         filter: Option<Expression>,
     ) -> Result<Vec<Row>> {
         if let Some(expr) = filter {
+            // filter 只能是 Operation
             let op = expr.as_operation().ok_or(InternalError(format!(
                 "Unsupported filter expression {:?}",
                 expr
             )))?;
             let mut new_rows = Vec::new();
+
+            // 遍历每一行，根据 filter 条件过滤
             for row in rows {
-                if Self::evaluate(op, columns, &row)? {
+                if op.evaluate(columns, &row)? {
                     new_rows.push(row);
                 }
             }
@@ -391,18 +476,44 @@ impl<S: Storage> Executor<S> {
         offset: Option<Expression>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         // 从 Join 表中扫描数据并过滤
-        let (columns, rows) = self.scan_from_join(&from)?;
-        let mut rows = Self::filter_rows(rows, &columns, filter)?;
+        let (mut columns, rows) = self.scan_from_join(&from)?;
+
+        // 处理过滤
+        let mut rows = self.filter_rows(rows, &columns, filter)?;
 
         // 处理排序
         if !ordering.is_empty() {
             self.sort_rows(&mut rows, &columns, ordering)?;
         }
 
+        // SELECT * 的情况下 select_columns 是空的
+        if !select_columns.is_empty() {
+            if select_columns.iter().all(|(col, _)| col.is_field()) {
+                // 处理都是列名的情况
+                if groupby.is_some() {
+                    return Err(InternalError(
+                        "GROUP BY must have aggregate function".to_string(),
+                    ));
+                }
+                (columns, rows) = self.select_field_columns(&select_columns, &columns, rows)?;
+            } else {
+                // 处理有聚集函数的情况
+                (columns, rows) =
+                    self.select_aggregate_columns(&select_columns, &columns, rows, groupby)?;
+            }
+        } else {
+            // 如果没有选择列，但有 GROUP BY，必须有聚集函数
+            if groupby.is_some() {
+                return Err(InternalError(
+                    "GROUP BY must have aggregate function".to_string(),
+                ));
+            }
+        }
+
         // 处理 limit 和 offset
         if !(offset.is_none() && limit.is_none()) {
-            let to_usize = |expr: Option<Expression>, default: usize, err_prefix: &str| {
-                expr.map_or(Ok(default), |e| match Value::from(&e) {
+            let convert_to_usize = |expr: Option<Expression>, default: usize, err_prefix: &str| {
+                expr.map_or(Ok(default), |e| match Value::try_from(&e)? {
                     Value::Integer(v) if v >= 0 => Ok(v as usize),
                     other => Err(InternalError(format!(
                         "{} must be a non-negative integer, get {:?}",
@@ -410,8 +521,8 @@ impl<S: Storage> Executor<S> {
                     ))),
                 })
             };
-            let offset = to_usize(offset, 0, "Offset")?;
-            let limit = to_usize(limit, usize::MAX, "Limit")?;
+            let offset = convert_to_usize(offset, 0, "Offset")?;
+            let limit = convert_to_usize(limit, usize::MAX, "Limit")?;
             rows = rows
                 .into_iter()
                 .skip(offset)
@@ -419,67 +530,41 @@ impl<S: Storage> Executor<S> {
                 .collect::<Vec<_>>();
         }
 
-        // 如果是 SELECT *，直接返回
-        if select_columns.is_empty() {
-            // 如果有 GROUP BY，必须有聚集函数
-            if groupby.is_some() {
-                return Err(InternalError(
-                    "GROUP BY must have aggregate function".to_string(),
-                ));
-            }
-            // 将列名从 table_name.col_name 改为 col_name
-            let columns = columns
-                .into_iter()
-                .map(|full_name| Self::extract_column_name(&full_name).to_string())
-                .collect();
+        // 将 columns 从 Column 结构体转换为字符串
+        let columns = columns.into_iter().map(|col| col.to_string()).collect();
 
-            return Ok((columns, rows));
-        }
-
-        // 如果没有聚集函数和 GROUP BY，直接选择列名
-        if select_columns.iter().all(|(col, _)| col.is_field()) {
-            if groupby.is_some() {
-                return Err(InternalError(
-                    "GROUP BY must have aggregate function".to_string(),
-                ));
-            }
-
-            let (new_columns, new_rows) =
-                self.select_field_columns(&select_columns, &columns, rows)?;
-            return Ok((new_columns, new_rows));
-        }
-
-        // 如果有聚集函数
-        let (new_columns, new_rows) =
-            Self::select_aggregate_columns(&select_columns, &columns, rows, groupby)?;
-        Ok((new_columns, new_rows))
+        Ok((columns, rows))
     }
 
     /// 选择列名
     fn select_field_columns(
         &self,
         select_columns: &[(Expression, Option<String>)],
-        columns: &[String],
+        columns: &[Column],
         rows: Vec<Row>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
+    ) -> Result<(Vec<Column>, Vec<Row>)> {
         // 一次性收集新列名
         let new_columns = select_columns
             .iter()
-            .map(|(col_expr, alias)| match col_expr {
-                Expression::Field(col_name) => alias
-                    .clone()
-                    .unwrap_or_else(|| Self::extract_column_name(col_name).to_string()),
-                _ => unreachable!(),
-            })
-            .collect::<Vec<_>>();
+            .map(|(col_expr, alias)| {
+                // 列名只允许是字段名
+                if !col_expr.is_field() {
+                    Err(InternalError(format!(
+                        "Unsupported column {col_expr} in SELECT"
+                    )))
+                } else {
+                    let mut column = Column::try_from(col_expr)?;
+                    column.alias = alias.clone(); // 为列设置别名
 
-        // 收集需要选择的列索引
-        let col_indices = select_columns
-            .iter()
-            .map(|(col_expr, _)| match col_expr {
-                Expression::Field(col_name) => get_column_index_by_name(columns, col_name),
-                _ => unreachable!(),
+                    Ok(column)
+                }
             })
+            .collect::<Result<Vec<_>>>()?;
+
+        // 收集新列名在原列中的索引
+        let col_indices = new_columns
+            .iter()
+            .map(|col| get_column_index(columns, col))
             .collect::<Result<Vec<_>>>()?;
 
         // 选择需要的列
@@ -492,119 +577,106 @@ impl<S: Storage> Executor<S> {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+
         Ok((new_columns, rows))
     }
 
     /// 选择聚集函数的列
     fn select_aggregate_columns(
+        &self,
         select_columns: &[(Expression, Option<String>)],
-        columns: &[String],
+        columns: &[Column],
         rows: Vec<Row>,
-        groupby: Option<(Vec<Expression>, Option<Expression>)>,
-    ) -> Result<(Vec<String>, Vec<Row>)> {
-        // 解析 GROUP BY，可以是 None，也可以是一个或多个字段
-        let group_names = groupby
-            .as_ref()
-            .map(|(group, _)| {
-                group
-                    .iter()
-                    .map(|expr| match expr {
-                        Expression::Field(col_name) => Ok(col_name),
-                        _ => Err(InternalError(format!(
-                            "Unsupported column {:?} in GROUP BY",
-                            expr
-                        ))),
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
-            .transpose()?;
-
+        groupby_having: Option<(Vec<Expression>, Option<Expression>)>,
+    ) -> Result<(Vec<Column>, Vec<Row>)> {
         // 一次性收集新列名
         let new_columns = select_columns
             .iter()
-            .map(|(col, alias)| match col {
-                Expression::Function(agg, col_name) => Ok(alias
-                    .clone()
-                    .unwrap_or_else(|| format!("{}({})", agg, col_name))),
-                Expression::Field(col_name) => {
-                    // 列名必须在 GROUP BY 中
-                    if group_names.is_none() || !group_names.as_ref().unwrap().contains(&col_name) {
-                        return Err(InternalError(format!(
-                            "Column {} must be in GROUP BY",
-                            col_name,
-                        )));
-                    }
-                    Ok(alias.clone().unwrap_or_else(|| col_name.clone()))
-                }
-                others => Err(InternalError(format!(
-                    "Unsupported column {:?} in SELECT",
-                    others
-                ))),
+            .map(|(col, alias)| {
+                let mut column = Column::try_from(col)?;
+                column.alias = alias.clone();
+
+                Ok(column)
             })
-            .collect::<Result<Vec<String>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         // 如果没有 GROUP BY，直接计算聚集函数的值
-        if group_names.is_none() {
+        if groupby_having.is_none() {
             let agg_values = select_columns
                 .iter()
-                .map(|(col, _)| match col {
-                    Expression::Function(agg, col_name) => {
-                        aggregate(col_name, columns, &rows, *agg)
-                    }
-                    _ => unreachable!(),
-                })
+                .map(|(col, _)| aggregate(&Column::try_from(col)?, columns, &rows))
                 .collect::<Result<Vec<Value>>>()?;
 
             return Ok((new_columns, vec![agg_values]));
         }
 
         // 如果有 GROUP BY，按照 GROUP BY 列进行分组
-        let group_indices = group_names
-            .as_ref()
-            .unwrap()
+        let (groupby, having) = groupby_having.unwrap();
+
+        // 获取 GROUP BY 列
+        let group_columns = groupby
             .iter()
-            .map(|group_name| get_column_index_by_name(columns, group_name))
+            .map(|expr| {
+                // 获取列
+                if expr.is_field() {
+                    Column::try_from(expr)
+                } else {
+                    // GROUP BY 只能是列名
+                    Err(InternalError(format!(
+                        "Unsupported column {expr} in GROUP BY",
+                    )))
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
-        let mut group_map: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
+
+        // 获取 GROUP BY 列在 columns 中的索引
+        let group_column_indices = group_columns
+            .iter()
+            .map(|col| get_column_index(columns, col))
+            .collect::<Result<Vec<_>>>()?;
+
+        // 根据指定的分组列，将所有行按照分组列的值聚集到一个 HashMap 中
+        let mut group_map: HashMap<_, Vec<Row>> = HashMap::new();
         for row in rows {
-            let group_key = group_indices
+            let group_key = group_column_indices
                 .iter()
                 .map(|&group_idx| row[group_idx].clone())
                 .collect::<Vec<_>>();
             group_map.entry(group_key).or_default().push(row);
         }
 
-        // 计算聚集函数的值
-        let group_index_map = group_names
-            .as_ref()
-            .unwrap()
-            .iter()
-            .enumerate()
-            .map(|(i, group_name)| (group_name, i))
-            .collect::<HashMap<_, _>>();
+        // 遍历每个分组，计算聚集函数的值
         let new_rows = group_map
             .into_iter()
-            .map(|(group_keys, group_rows)| {
+            .map(|(group_key, group_rows)| {
                 let agg_values = select_columns
                     .iter()
-                    .map(|(col, _)| match col {
-                        Expression::Function(agg, col_name) => {
-                            aggregate(col_name, columns, &group_rows, *agg)
+                    .map(|(expr, _)| {
+                        if expr.is_function() {
+                            let column = Column::try_from(expr)?;
+                            // 如果是聚集函数，计算聚集函数的值
+                            aggregate(&column, columns, &group_rows)
+                        } else if expr.is_field() {
+                            // 如果不是聚集函数，必须是 GROUP BY 列中的字段
+                            let column = Column::try_from(expr)?;
+                            let idx = group_columns.iter().position(|col| *col == column).ok_or(
+                                InternalError(format!("Column {} not found in GROUP BY", column)),
+                            )?;
+                            let value = group_key[idx].clone();
+                            Ok(value)
+                        } else {
+                            Err(InternalError(format!(
+                                "Unsupported column {expr} in SELECT"
+                            )))
                         }
-                        // 列一定等于 GROUP BY 列，因为在上面的 match 中已经处理
-                        Expression::Field(col_name) => {
-                            Ok(group_keys[group_index_map[&col_name]].clone())
-                        }
-                        // 不可能出现其他情况，在上面的 match 中已经处理
-                        _ => unreachable!(),
                     })
-                    .collect::<Result<Vec<Value>>>()?;
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(agg_values)
             })
-            .collect::<Result<Vec<Row>>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         // 过滤不符合 HAVING 条件的行
-        let new_rows = Self::filter_rows(new_rows, &new_columns, groupby.unwrap().1)?;
+        let new_rows = self.filter_rows(new_rows, &new_columns, having)?;
 
         Ok((new_columns, new_rows))
     }
@@ -613,14 +685,15 @@ impl<S: Storage> Executor<S> {
     fn sort_rows(
         &self,
         rows: &mut [Row],
-        columns: &[String],
+        columns: &[Column],
         ordering: Vec<(String, Ordering)>,
     ) -> Result<()> {
-        // columns 改为了 table_name.col_name 的形式，这里需要处理
+        // 将列名转换为 Column 结构体，并匹配列索引
         let ordering = ordering
             .into_iter()
             .map(|(col_name, ord)| {
-                get_column_index_by_name(columns, &col_name).map(|col_idx| (col_idx, ord))
+                let col = Column::try_from(col_name.as_str())?;
+                get_column_index(columns, &col).map(|col_idx| (col_idx, ord))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -641,62 +714,6 @@ impl<S: Storage> Executor<S> {
         });
 
         Ok(())
-    }
-
-    /// 从 `table_name.column_name` 中提取 `column_name`
-    #[inline]
-    fn extract_column_name(full_column_name: &str) -> &str {
-        full_column_name
-            .split('.')
-            .last()
-            .unwrap_or(full_column_name)
-    }
-
-    /// 将 `column_name` 添加 `table_name` 前缀
-    #[inline]
-    fn add_table_name_prefix(table_name: &str, column_name: &str) -> String {
-        format!("{}.{}", table_name, column_name)
-    }
-}
-
-/// 根据列名查找列索引
-///
-/// columns 为 table_name.col_name 的形式，col_name 可能为 col_name 或 table_name.col_name
-fn get_column_index_by_name(columns: &[String], col_name: &str) -> Result<usize> {
-    let parts = col_name.split('.').collect::<Vec<_>>();
-    match parts.len() {
-        1 => {
-            // 仅包含 col_name，则按照最后部分匹配
-            let matches = columns
-                .iter()
-                .enumerate()
-                .filter(|(_, full_name)| full_name.split('.').last().unwrap() == parts[0])
-                .collect::<Vec<_>>();
-            if matches.len() == 1 {
-                Ok(matches[0].0)
-            } else if matches.is_empty() {
-                Err(InternalError(format!(
-                    "Column {} not found in table",
-                    col_name
-                )))
-            } else {
-                Err(InternalError(format!(
-                    "Column {} is ambiguous in table",
-                    col_name
-                )))
-            }
-        }
-        2 => {
-            // 包含 table_name.col_name，则直接查找
-            columns
-                .iter()
-                .position(|full_name| full_name == col_name)
-                .ok_or(InternalError(format!(
-                    "Column {} not found in table",
-                    col_name
-                )))
-        }
-        _ => unreachable!("More than 2 dots in column name"), // 不可能出现其他情况
     }
 }
 
@@ -1812,7 +1829,7 @@ mod tests {
         assert_eq!(columns, vec!["grade", "count"]);
         assert_eq!(rows, vec![vec![Value::Integer(80), Value::Integer(2)]]);
 
-        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING count = 2
+        // 测试 SELECT grade, COUNT(*) AS count FROM grades GROUP BY grade HAVING COUNT(*) = 2
         let (columns, rows) = executor.select(
             vec![
                 (Expression::Field("grade".to_string()), None),
@@ -1828,7 +1845,7 @@ mod tests {
             Some((
                 vec![Expression::Field("grade".to_string())],
                 Some(Expression::Operation(Operation::Equal(
-                    Box::new(Expression::Field("count".to_string())),
+                    Box::new(Expression::Function(Aggregate::Count, "*".to_string())),
                     Box::new(Expression::Constant(Constant::Integer(2))),
                 ))),
             )),
@@ -1873,7 +1890,7 @@ mod tests {
             None,
             None,
         )?;
-        assert_eq!(columns, vec!["users.name", "MAX(grade)"]);
+        assert_eq!(columns, vec!["name", "MAX(grade)"]);
         assert_eq!(rows.len(), 2);
         assert!(rows.contains(&vec![
             Value::String("Alice".to_string()),
@@ -1918,7 +1935,7 @@ mod tests {
             None,
             None,
         )?;
-        assert_eq!(columns, vec!["users.name", "MAX(grades.grade)"]);
+        assert_eq!(columns, vec!["name", "MAX(grade)"]);
 
         assert_eq!(
             rows,

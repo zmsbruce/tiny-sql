@@ -118,18 +118,22 @@ impl Hash for Value {
 
 impl Eq for Value {}
 
-impl From<&Expression> for Value {
-    /// 将表达式转为值
-    fn from(expr: &Expression) -> Self {
+impl TryFrom<&Expression> for Value {
+    type Error = crate::Error;
+
+    fn try_from(expr: &Expression) -> Result<Self> {
         match expr {
             Expression::Constant(c) => match c {
-                Constant::Boolean(b) => Value::Boolean(*b),
-                Constant::Float(f) => Value::Float(*f),
-                Constant::Integer(i) => Value::Integer(*i),
-                Constant::String(s) => Value::String(s.clone()),
-                Constant::Null => Value::Null,
+                Constant::Boolean(b) => Ok(Value::Boolean(*b)),
+                Constant::Float(f) => Ok(Value::Float(*f)),
+                Constant::Integer(i) => Ok(Value::Integer(*i)),
+                Constant::String(s) => Ok(Value::String(s.clone())),
+                Constant::Null => Ok(Value::Null),
             },
-            _ => panic!("Cannot convert non-constant expression to value"),
+            e => Err(InternalError(format!(
+                "Cannot convert non-constant expression {:?} to value",
+                e
+            ))),
         }
     }
 }
